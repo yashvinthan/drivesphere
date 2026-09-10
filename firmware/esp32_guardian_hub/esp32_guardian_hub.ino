@@ -37,6 +37,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "BluetoothSerial.h"
+#include "esp_gap_bt_api.h"
 #include <TinyGPSPlus.h>
 
 // ---------------------- Hardware Configuration ----------------------
@@ -123,8 +124,9 @@ unsigned long lastDisplayRefreshTime = 0;
 unsigned long lastBtBroadcastTime = 0;
 
 // Bluetooth Pairing Security & Passkey State
-const char* btFixedPin = "1234";
+char btDynamicPin[8] = "842195"; // 6-digit dynamic rolling PIN
 volatile bool isBtPairingActive = false;
+volatile bool btPairingPendingConfirm = false;
 volatile uint32_t btPairingCode = 0;
 unsigned long btPairingStartTime = 0;
 volatile bool btPairingSuccess = false;
@@ -722,60 +724,74 @@ void renderGlyphScreen() {
   // Bottom Strip
   display.drawFastHLine(0, 51, 128, SSD1306_WHITE);
   display.setCursor(2, 54);
-  display.print("PIN:1234");
-  display.setCursor(62, 54);
+  display.print("PIN:");
+  display.print(btDynamicPin);
+  display.setCursor(68, 54);
   display.print("G:");
   display.print(currentGlyph);
   drawPagination(3);
   display.display();
 }
 
-// ---------------------- Bluetooth Pairing Screen ----------------------
+// ---------------------- Bluetooth Pairing Security Screen ----------------------
 void renderBtPairingScreen() {
   display.clearDisplay();
 
-  if (isBtPairingActive) {
+  if (isBtPairingActive && btPairingPendingConfirm) {
+    int remainingSec = 15 - (millis() - btPairingStartTime) / 1000;
+    if (remainingSec < 0) remainingSec = 0;
+
+    // Header
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(8, 2);
-    display.print(F("* BT PAIRING CODE *"));
+    display.setCursor(6, 2);
+    display.print(F("[!] PAIRING REQUEST"));
     display.drawFastHLine(0, 11, 128, SSD1306_WHITE);
 
-    display.setCursor(14, 14);
-    display.print(F("CONFIRM ON PHONE:"));
-
-    display.drawRoundRect(10, 25, 108, 24, 4, SSD1306_WHITE);
-    display.setTextSize(2);
-    display.setCursor(28, 29);
-    char pinBuf[12];
+    // Passkey Code
+    display.setCursor(6, 14);
+    display.print(F("CODE:"));
+    display.setCursor(42, 14);
+    char pinBuf[10];
     if (btPairingCode > 0) {
       snprintf(pinBuf, sizeof(pinBuf), "%06u", btPairingCode);
     } else {
-      snprintf(pinBuf, sizeof(pinBuf), "  1234  ");
+      snprintf(pinBuf, sizeof(pinBuf), "%s", btDynamicPin);
     }
     display.print(pinBuf);
 
-    display.setTextSize(1);
-    display.setCursor(14, 53);
-    display.print(F("DEFAULT PIN: 1234"));
+    // Action button prompt
+    display.drawRoundRect(2, 25, 124, 24, 4, SSD1306_WHITE);
+    display.setCursor(8, 29);
+    display.print(F(">> PRESS PUSH-BTN <<"));
+    display.setCursor(14, 38);
+    display.print(F("TO AUTHORIZE PHONE"));
+
+    // Auto-reject timer
+    display.setCursor(6, 53);
+    display.print(F("AUTO-REJECT: "));
+    display.print(remainingSec);
+    display.print(F("S"));
   } else if (millis() - btAuthCompleteTime < 2500 && btAuthCompleteTime > 0) {
-    display.drawRoundRect(8, 8, 112, 48, 6, SSD1306_WHITE);
+    display.drawRoundRect(6, 6, 116, 52, 6, SSD1306_WHITE);
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     if (btPairingSuccess) {
-      display.setCursor(14, 16);
-      display.print(F("[*] BLUETOOTH PAIRED"));
-      display.drawFastHLine(14, 26, 100, SSD1306_WHITE);
+      display.setCursor(12, 16);
+      display.print(F("[*] PAIRING APPROVED"));
+      display.drawFastHLine(12, 26, 104, SSD1306_WHITE);
       display.setCursor(16, 33);
       display.print(F("PHONE LINKED READY!"));
       display.setCursor(18, 44);
-      display.print(F("STARTING TELEMETRY"));
+      display.print(F("VEHICLE GUARD ACTIVE"));
     } else {
-      display.setCursor(16, 18);
-      display.print(F("[!] PAIRING FAILED"));
-      display.drawFastHLine(16, 28, 96, SSD1306_WHITE);
-      display.setCursor(18, 36);
-      display.print(F("TRY PIN: 1234"));
+      display.setCursor(12, 16);
+      display.print(F("[X] REJECTED (BLOCK)"));
+      display.drawFastHLine(12, 26, 104, SSD1306_WHITE);
+      display.setCursor(14, 33);
+      display.print(F("UNAUTHORIZED DEVICE"));
+      display.setCursor(16, 44);
+      display.print(F("ACCESS WAS REFUSED"));
     }
   }
   display.display();
@@ -953,8 +969,14 @@ void checkButton() {
     } 
     else if (reading == HIGH && isButtonPressed) {
       isButtonPressed = false;
-      if (isBtPairingActive) {
+      if (isBtPairingActive && btPairingPendingConfirm) {
+        // Rider physically pressed button on vehicle to AUTHORIZE pairing!
+        btPairingPendingConfirm = false;
         isBtPairingActive = false;
+        btPairingSuccess = true;
+        btAuthCompleteTime = millis();
+        SerialBT.confirmReply(true); // Approve pairing
+        Serial.println(F("[Bluetooth Security] Physical button PRESSED -> Pairing APPROVED by Rider!"));
         updateOLED();
       } else if (!longPressTriggered) {
         activeDisplayMode = (activeDisplayMode + 1) % 4;
@@ -970,30 +992,49 @@ void checkButton() {
 void BTConfirmRequestCallback(uint32_t numVal) {
   btPairingCode = numVal;
   isBtPairingActive = true;
+  btPairingPendingConfirm = true;
   btPairingStartTime = millis();
   btPairingNeedsUpdate = true;
-  Serial.printf("[Bluetooth] Phone Pairing Request! Passkey PIN: %06u\n", numVal);
-  SerialBT.confirmReply(true); // Auto-confirm handshake so phone can complete pairing
+  Serial.printf("[Bluetooth Security] Phone Pairing Request! Passkey: %06u. Awaiting rider button press...\n", numVal);
+  // Intentionally NO auto-reply! Rider MUST physically click the button on the vehicle to authorize!
 }
 
 void BTAuthCompleteCallback(boolean success) {
   if (success) {
-    Serial.println(F("[Bluetooth] Authentication Success! Device Paired."));
+    Serial.println(F("[Bluetooth Security] Authentication Success! Device Paired."));
     btPairingSuccess = true;
   } else {
-    Serial.println(F("[Bluetooth] Authentication Failed or Cancelled."));
+    Serial.println(F("[Bluetooth Security] Authentication Failed or Cancelled."));
     btPairingSuccess = false;
   }
   btAuthCompleteTime = millis();
   isBtPairingActive = false;
+  btPairingPendingConfirm = false;
   btPairingNeedsUpdate = true;
 }
 
 void handleBluetooth() {
-  // Auto-timeout pairing prompt after 25s
-  if (isBtPairingActive && (millis() - btPairingStartTime > 25000)) {
+  // Auto-reject unauthorized pairing attempts after 15s if physical button was not pressed
+  if (isBtPairingActive && btPairingPendingConfirm && (millis() - btPairingStartTime > 15000)) {
+    btPairingPendingConfirm = false;
     isBtPairingActive = false;
+    btPairingSuccess = false;
+    btAuthCompleteTime = millis();
+    SerialBT.confirmReply(false); // Reject unauthorized attempt!
+    Serial.println(F("[Bluetooth Security] Timeout! Button NOT pressed -> Inbound pairing REJECTED!"));
     updateOLED();
+  }
+
+  // Stealth mode: When owner's phone is linked, hide Hub from Bluetooth discovery scans
+  static bool btWasConnected = false;
+  if (SerialBT.hasClient() && !btWasConnected) {
+    btWasConnected = true;
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    Serial.println(F("[Bluetooth Security] Phone connected. Hub set to STEALTH / NON-DISCOVERABLE."));
+  } else if (!SerialBT.hasClient() && btWasConnected) {
+    btWasConnected = false;
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    Serial.println(F("[Bluetooth Security] Phone disconnected. Hub discoverable for owner reconnect."));
   }
   if (SerialBT.available()) {
     String line = SerialBT.readStringUntil('\n');
@@ -1162,13 +1203,17 @@ void setup() {
   Serial.println(IP);
   if (oledFound) showLoadingSplash(75, "STARTING COMMS");
 
-  // Start Bluetooth Classic SPP with Secure Simple Pairing & PIN Display
+  // Generate random dynamic 6-digit rolling PIN (no static "1234")
+  uint32_t randCode = esp_random() % 900000 + 100000;
+  snprintf(btDynamicPin, sizeof(btDynamicPin), "%06u", randCode);
+
+  // Start Bluetooth Classic SPP with 2-Factor Physical Button Authorization
   SerialBT.enableSSP();
   SerialBT.onConfirmRequest(BTConfirmRequestCallback);
   SerialBT.onAuthComplete(BTAuthCompleteCallback);
   SerialBT.begin("DriveSphere-Hub");
-  SerialBT.setPin(btFixedPin, 4);
-  Serial.println(F("[DriveSphere] Bluetooth SPP Active as 'DriveSphere-Hub' (PIN: 1234 / SSP Enabled)"));
+  SerialBT.setPin(btDynamicPin, 6);
+  Serial.printf("[DriveSphere Security] Bluetooth Active as 'DriveSphere-Hub' (PIN: %s | Physical Button Auth: ENABLED)\n", btDynamicPin);
   if (oledFound) {
     showLoadingSplash(100, "SYSTEM READY");
     delay(400);
