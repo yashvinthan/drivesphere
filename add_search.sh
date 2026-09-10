@@ -1,0 +1,2 @@
+sed -i 's/import androidx.compose.material.icons.filled.Star/import androidx.compose.material.icons.filled.Star\nimport androidx.compose.material.icons.filled.Search/g' app/src/main/java/com/example/ui/screens/HomeDashboard.kt
+sed -i 's/import androidx.compose.runtime.getValue/import androidx.compose.runtime.getValue\nimport androidx.compose.runtime.setValue\nimport androidx.compose.runtime.mutableStateOf\nimport androidx.compose.runtime.remember/g' app/src/main/java/com/example/ui/screens/HomeDashboard.kt

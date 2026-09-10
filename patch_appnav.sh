@@ -1,0 +1,1 @@
+sed -i 's/onNavigateToHub = { navController.navigate("hub") }/onNavigateToHub = { navController.navigate("hub") },\n                    onToggleTheme = { viewModel.toggleTheme() },\n                    onSOS = { \n                        viewModel.triggerEvent(TripEvent.FALL) \n                    }/g' app/src/main/java/com/example/AppNavigation.kt

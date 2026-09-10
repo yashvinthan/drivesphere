@@ -1,0 +1,6 @@
+{
+  "name": "DriveSphere",
+  "description": "A safer-trip companion for college riders.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
