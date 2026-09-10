@@ -29,6 +29,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.viewmodel.AppState
+import com.example.viewmodel.HardwareTransport
 import com.example.viewmodel.VehicleType
 import kotlinx.coroutines.delay
 
@@ -117,7 +118,7 @@ fun HomeDashboard(
             }
         }
 
-        // Hardware Status Pill
+        // Hardware Status Pill (Interactive link to Guardian Hub)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -125,19 +126,41 @@ fun HomeDashboard(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(if (state.isEsp32Connected) Color(0xFF00E676) else Color(0xFF29B6F6))
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = if (state.isEsp32Connected) "ESP32 HUB: 192.168.4.1 (ONLINE)" else "SMARTPHONE SENSORS ACTIVE",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color.Gray
-                )
+            Surface(
+                modifier = Modifier.clickable { onNavigateToHub() },
+                color = Color(0xFF141414),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, if (state.isEsp32Connected) Color(0xFF00E676).copy(alpha = 0.4f) else Color(0xFF282828))
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(if (state.isEsp32Connected) Color(0xFF00E676) else Color(0xFF29B6F6))
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    val statusLabel = if (state.isEsp32Connected) {
+                        if (state.hardwareTransport == HardwareTransport.BLUETOOTH) "ESP32 BT LINKED" else "ESP32 WI-FI LINKED"
+                    } else {
+                        "HUB DISCONNECTED • TAP TO LINK"
+                    }
+                    Text(
+                        text = statusLabel,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = if (state.isEsp32Connected) Color(0xFF00E676) else Color(0xFF888888)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Icon(
+                        imageVector = Icons.Default.ChevronRight,
+                        contentDescription = "Open Hub",
+                        tint = Color(0xFF666666),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
             }
 
             if (state.isVehicleGuardArmed) {

@@ -74,12 +74,12 @@ class BluetoothHubRepository : HubRepository {
                 bluetoothAdapter.getRemoteDevice(deviceAddress)
             } else {
                 bluetoothAdapter.bondedDevices?.firstOrNull { 
-                    it.name?.contains(TARGET_DEVICE_NAME, ignoreCase = true) == true 
+                    it.name?.contains("DriveSphere", ignoreCase = true) == true 
                 }
             }
 
             if (targetDevice == null) {
-                _status.value = "Device 'DriveSphere-Hub' not paired yet"
+                _status.value = "Device 'DriveSphere' not found in paired devices"
                 return@withContext Result.failure(
                     Exception("Device 'DriveSphere-Hub' not found in paired list. Please pair it in your phone's Bluetooth settings first.")
                 )
