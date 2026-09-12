@@ -37,10 +37,11 @@ Standard ESP32-CAM modules do not have an on-board USB port. Use an FTDI or USB-
 ## 3. Uploading Firmware
 
 ### Automated CLI Upload
-With your FTDI adapter connected to your PC (e.g. `COM5`):
+Run the dedicated flasher script from the project root:
 ```bash
-tools/arduino-cli/arduino-cli.exe upload -p COM5 --fqbn esp32:esp32:esp32cam firmware/esp32_cam
+python tools/flash_cam.py
 ```
+(Connect GPIO 0 to GND when prompted, then remove it and press RESET after flashing).
 
 ### Arduino IDE
 1. Open Arduino IDE.
@@ -56,11 +57,12 @@ tools/arduino-cli/arduino-cli.exe upload -p COM5 --fqbn esp32:esp32:esp32cam fir
 
 | Endpoint | Method | Format | Description |
 | :--- | :--- | :--- | :--- |
-| `/stream` | `GET` | `multipart/x-mixed-replace` | Real-time MJPEG live video stream (~25 FPS) |
+| `/stream` | `GET` | `multipart/x-mixed-replace` | Real-time MJPEG live video stream (~25 FPS, non-blocking) |
 | `/capture` | `GET` | `image/jpeg` | High-res JPEG snapshot for on-device AI classification |
-| `/status` | `GET` | `application/json` | Camera readiness, IP, Wi-Fi mode, and endpoints |
-| `/flash` | `POST` | `application/json` | Toggle or set high-power white LED (`?state=1` / `?state=0`) |
-| `/flip` | `POST` | `application/json` | Invert or mirror video feed for flexible mounting |
+| `/status` | `GET` | `application/json` | Camera readiness, FPS, IP, Wi-Fi mode, memory, and telemetry |
+| `/flash` | `GET/POST` | `application/json` | Toggle or set LED brightness (`?state=1&brightness=128`) |
+| `/flip` | `GET/POST` | `application/json` | Invert or mirror video feed (`?vflip=1&hmirror=0`) |
+| `/control` | `GET` | `application/json` | Dynamic sensor settings (`?var=framesize&val=...`) |
 
 ---
 

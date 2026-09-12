@@ -92,6 +92,8 @@ dependencies {
   
   implementation(libs.androidx.compose.ui.graphics)
   implementation("org.osmdroid:osmdroid-android:6.1.18")
+  implementation(libs.mlkit.objects.detection)
+  implementation(libs.mlkit.face.detection)
   implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.core.ktx)
   // implementation(libs.androidx.datastore.preferences)

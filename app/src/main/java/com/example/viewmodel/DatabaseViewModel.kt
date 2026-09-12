@@ -95,4 +95,20 @@ class DatabaseViewModel(application: Application) : AndroidViewModel(application
             onRedeemed()
         }
     }
+
+    fun syncOfficialParivahanChallans(
+        vehicleNo: String,
+        onResult: (isSuccess: Boolean, message: String, count: Int) -> Unit
+    ) {
+        viewModelScope.launch {
+            val result = com.example.data.ParivahanChallanService.verifyVehicleOnParivahan(vehicleNo)
+            if (result.isSuccess) {
+                val data = result.getOrThrow()
+                onResult(true, data.message, data.pendingChallanCount)
+            } else {
+                val err = result.exceptionOrNull()?.message ?: "Parivahan query failed"
+                onResult(false, err, 0)
+            }
+        }
+    }
 }

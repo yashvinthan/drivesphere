@@ -1,10 +1,12 @@
 import subprocess
 import time
 import sys
+import os
 
-arduino_cli = r"c:\Users\yashv\dev\work in progress\drivesphere\tools\arduino-cli\arduino-cli.exe"
-sketch_dir = r"c:\Users\yashv\dev\work in progress\drivesphere\firmware\esp32_guardian_hub"
-port = "COM5"
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+arduino_cli = os.path.join(base_dir, "tools", "arduino-cli", "arduino-cli.exe")
+sketch_dir = os.path.join(base_dir, "firmware", "esp32_guardian_hub")
+port = "COM4"
 
 print("=================================================================")
 print("  DriveSphere Live Flasher: Waiting for ESP32 on COM5...")

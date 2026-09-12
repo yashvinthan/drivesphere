@@ -41,8 +41,17 @@ interface HubRepository {
         speed: Int = 0, 
         score: Int = 100, 
         glyph: String = "IDLE",
-        vehicleMode: String = "BIKE"
+        vehicleMode: String = "BIKE",
+        screen: Int? = null
     )
+    suspend fun updateNavigation(
+        maneuver: String,
+        distance: String,
+        eta: String,
+        street: String,
+        isNavActive: Boolean = true
+    ) {}
+    suspend fun endNavigation() {}
     suspend fun resetHardwareSos()
     fun setHubIpAddress(ip: String)
     suspend fun pingHardware(): Result<String>
@@ -65,8 +74,9 @@ class StandaloneHubRepository : HubRepository {
         mode: String, 
         speed: Int, 
         score: Int, 
-        glyph: String,
-        vehicleMode: String
+        glyph: String, 
+        vehicleMode: String,
+        screen: Int?
     ) {
         // Standalone smartphone mode - no physical I2C display connected
     }

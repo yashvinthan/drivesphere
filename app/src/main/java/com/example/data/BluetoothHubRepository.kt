@@ -49,7 +49,7 @@ class BluetoothHubRepository : HubRepository {
     fun getPairedDevices(): List<Pair<String, String>> {
         return try {
             val bonded = bluetoothAdapter?.bondedDevices ?: emptySet()
-            bonded.map { it.name ?: "Unknown" to it.address }
+            bonded.map { Pair(it.name ?: "Unknown", it.address) }
         } catch (e: Exception) {
             emptyList()
         }
@@ -219,15 +219,43 @@ class BluetoothHubRepository : HubRepository {
         speed: Int,
         score: Int,
         glyph: String,
-        vehicleMode: String
-    ) = withContext(Dispatchers.IO) {
+        vehicleMode: String,
+        screen: Int?
+    ): Unit = withContext(Dispatchers.IO) {
         try {
-            val payload = "SPEED:$speed\nSCORE:$score\nMODE:$vehicleMode\nGLYPH:$glyph\n"
+            var payload = "SPEED:$speed\nSCORE:$score\nMODE:$vehicleMode\nGLYPH:$glyph\n"
+            if (screen != null) {
+                payload += "SCREEN:$screen\n"
+            }
             outputStream?.write(payload.toByteArray())
             outputStream?.flush()
         } catch (_: Exception) {
             _connected.value = false
         }
+        Unit
+    }
+
+    override suspend fun updateNavigation(
+        maneuver: String,
+        distance: String,
+        eta: String,
+        street: String,
+        isNavActive: Boolean
+    ): Unit = withContext(Dispatchers.IO) {
+        try {
+            val payload = "NAV:$maneuver,$distance,$eta,$street\nSCREEN:1\n"
+            outputStream?.write(payload.toByteArray())
+            outputStream?.flush()
+        } catch (_: Exception) {}
+        Unit
+    }
+
+    override suspend fun endNavigation(): Unit = withContext(Dispatchers.IO) {
+        try {
+            outputStream?.write("NAV:STOP\nSCREEN:0\n".toByteArray())
+            outputStream?.flush()
+        } catch (_: Exception) {}
+        Unit
     }
 
     override suspend fun resetHardwareSos() = withContext(Dispatchers.IO) {

@@ -16,3 +16,9 @@ __pycache__/
 local.properties
 .env
 debug.keystore
+.build-outputs/
+.gradle-user/
+APK_DOWNLOAD/
+scratch/
+*.zip
+tools/gradle-*/

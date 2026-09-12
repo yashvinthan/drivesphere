@@ -15,11 +15,31 @@ class Esp32HubRepository(
     private var baseIp: String = "192.168.4.1"
 ) : HubRepository {
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(2, TimeUnit.SECONDS)
-        .readTimeout(2, TimeUnit.SECONDS)
-        .writeTimeout(2, TimeUnit.SECONDS)
-        .build()
+    private var cachedClient: OkHttpClient? = null
+    private var lastBoundNetwork: android.net.Network? = null
+
+    private fun getClient(): OkHttpClient {
+        val currentNet = NetworkBinder.getWifiNetwork()
+        val existing = cachedClient
+        if (existing != null && lastBoundNetwork == currentNet) {
+            return existing
+        }
+
+        val builder = OkHttpClient.Builder()
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .writeTimeout(3, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+
+        if (currentNet != null) {
+            builder.socketFactory(currentNet.socketFactory)
+        }
+
+        val newClient = builder.build()
+        cachedClient = newClient
+        lastBoundNetwork = currentNet
+        return newClient
+    }
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
@@ -47,31 +67,48 @@ class Esp32HubRepository(
     }
 
     override suspend fun pingHardware(): Result<String> = withContext(Dispatchers.IO) {
-        val startTime = System.currentTimeMillis()
-        try {
-            val request = Request.Builder()
-                .url("http://$baseIp/status")
-                .get()
-                .build()
+        val targetIps = listOf(baseIp, "192.168.4.1", "192.168.4.2", "drivesphere-hub.local").distinct()
+        var lastException: Exception? = null
 
-            val response = client.newCall(request).execute()
-            val latency = System.currentTimeMillis() - startTime
-            if (response.isSuccessful) {
+        for (ip in targetIps) {
+            val startTime = System.currentTimeMillis()
+            // 1. Rapid direct TCP socket ping bound to Wi-Fi
+            val (tcpSuccess, tcpLatency) = NetworkBinder.pingHost(ip, 80, 2000)
+            if (tcpSuccess) {
+                baseIp = ip
                 _connected.value = true
-                _status.value = "Hardware Linked (${latency}ms)"
-                response.close()
-                Result.success("ESP32 Online! Latency: ${latency}ms")
-            } else {
-                _connected.value = false
-                _status.value = "ESP32 Error (HTTP ${response.code})"
-                response.close()
-                Result.failure(Exception("ESP32 returned HTTP error code ${response.code}"))
+                _status.value = "Hardware Linked (${tcpLatency}ms)"
+                return@withContext Result.success("ESP32 Online at $ip (Ping: ${tcpLatency}ms)")
             }
-        } catch (e: Exception) {
-            _connected.value = false
-            _status.value = "Standalone (Phone Sensors Active)"
-            Result.failure(Exception("Cannot reach ESP32 at $baseIp. Verify phone is connected to 'DriveSphere-Hub' Wi-Fi."))
+
+            // 2. HTTP GET /status validation
+            try {
+                val request = Request.Builder()
+                    .url("http://$ip/status")
+                    .get()
+                    .build()
+
+                val response = getClient().newCall(request).execute()
+                val latency = System.currentTimeMillis() - startTime
+                if (response.isSuccessful) {
+                    baseIp = ip
+                    _connected.value = true
+                    _status.value = "Hardware Linked (${latency}ms)"
+                    response.close()
+                    return@withContext Result.success("ESP32 Online at $ip! Latency: ${latency}ms")
+                } else {
+                    val code = response.code
+                    response.close()
+                    lastException = Exception("HTTP $code")
+                }
+            } catch (e: Exception) {
+                lastException = e
+            }
         }
+
+        _connected.value = false
+        _status.value = "Standalone (Phone Sensors Active)"
+        Result.failure(Exception("Cannot reach ESP32 ($lastException). Verify phone is connected to 'DriveSphere-Hub' Wi-Fi."))
     }
 
     private fun startHardwarePolling() {
@@ -84,7 +121,7 @@ class Esp32HubRepository(
                         .get()
                         .build()
 
-                    val response = client.newCall(request).execute()
+                    val response = getClient().newCall(request).execute()
                     if (response.isSuccessful) {
                         val body = response.body?.string()
                         if (!body.isNullOrBlank()) {
@@ -163,7 +200,8 @@ class Esp32HubRepository(
         speed: Int,
         score: Int,
         glyph: String,
-        vehicleMode: String
+        vehicleMode: String,
+        screen: Int?
     ) = withContext(Dispatchers.IO) {
         try {
             val json = JSONObject().apply {
@@ -173,6 +211,9 @@ class Esp32HubRepository(
                 put("score", score)
                 put("glyph", glyph)
                 put("vehicleMode", vehicleMode)
+                if (screen != null) {
+                    put("screen", screen)
+                }
             }
             val body = json.toString().toRequestBody(jsonMediaType)
             val request = Request.Builder()
@@ -180,10 +221,52 @@ class Esp32HubRepository(
                 .post(body)
                 .build()
 
-            client.newCall(request).execute().close()
+            getClient().newCall(request).execute().close()
         } catch (e: Exception) {
             // Standalone mode gracefully suppresses network exceptions
         }
+    }
+
+    override suspend fun updateNavigation(
+        maneuver: String,
+        distance: String,
+        eta: String,
+        street: String,
+        isNavActive: Boolean
+    ) = withContext(Dispatchers.IO) {
+        try {
+            val json = JSONObject().apply {
+                put("screen", 1)
+                put("navActive", isNavActive)
+                put("navManeuver", maneuver)
+                put("navDistance", distance)
+                put("navEta", eta)
+                put("navStreet", street)
+            }
+            val body = json.toString().toRequestBody(jsonMediaType)
+            val request = Request.Builder()
+                .url("http://$baseIp/display")
+                .post(body)
+                .build()
+
+            getClient().newCall(request).execute().close()
+        } catch (_: Exception) {}
+    }
+
+    override suspend fun endNavigation() = withContext(Dispatchers.IO) {
+        try {
+            val json = JSONObject().apply {
+                put("screen", 0)
+                put("navActive", false)
+            }
+            val body = json.toString().toRequestBody(jsonMediaType)
+            val request = Request.Builder()
+                .url("http://$baseIp/display")
+                .post(body)
+                .build()
+
+            getClient().newCall(request).execute().close()
+        } catch (_: Exception) {}
     }
 
     override suspend fun resetHardwareSos() = withContext(Dispatchers.IO) {
@@ -195,7 +278,7 @@ class Esp32HubRepository(
                 .post(emptyBody)
                 .build()
 
-            client.newCall(request).execute().close()
+            getClient().newCall(request).execute().close()
         } catch (e: Exception) {
             _hardwareSos.value = false
         }

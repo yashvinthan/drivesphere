@@ -36,9 +36,42 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#define ENABLE_BLUETOOTH false
+
+#if ENABLE_BLUETOOTH
 #include "BluetoothSerial.h"
 #include "esp_gap_bt_api.h"
+#endif
 #include <TinyGPSPlus.h>
+#include "esp_camera.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ---------------------- AI-Thinker Camera Hardware Pins ----------------------
+#define CAM_PWDN_GPIO_NUM     32
+#define CAM_RESET_GPIO_NUM    -1
+#define CAM_XCLK_GPIO_NUM      0
+#define CAM_SIOD_GPIO_NUM     26
+#define CAM_SIOC_GPIO_NUM     27
+#define CAM_Y9_GPIO_NUM       35
+#define CAM_Y8_GPIO_NUM       34
+#define CAM_Y7_GPIO_NUM       39
+#define CAM_Y6_GPIO_NUM       36
+#define CAM_Y5_GPIO_NUM       21
+#define CAM_Y4_GPIO_NUM       19
+#define CAM_Y3_GPIO_NUM       18
+#define CAM_Y2_GPIO_NUM        5
+#define CAM_VSYNC_GPIO_NUM    25
+#define CAM_HREF_GPIO_NUM     23
+#define CAM_PCLK_GPIO_NUM     22
+
+#define FLASH_LED_PIN          4
+#define FLASH_PWM_FREQ      5000
+#define FLASH_PWM_RES          8
+
+bool cameraFound = false;
+uint8_t camSensorPid = 0;
+int flashBrightness = 0;
 
 // ---------------------- Hardware Configuration ----------------------
 #define SCREEN_WIDTH    128
@@ -46,13 +79,15 @@
 #define OLED_RESET      -1
 #define SCREEN_ADDRESS  0x3C // Standard I2C address for SSD1306
 
-// OLED Display Pins (Hardware I2C Bus 0)
-#define I2C_SDA_PIN     15   // OLED SDA on GPIO 15
-#define I2C_SCL_PIN     14   // OLED SCL on GPIO 14
+// OLED Display Pins (Hardware Wire Bus 0)
+#define OLED_SDA_PIN    15   // SSD1306 OLED SDA on GPIO 15
+#define OLED_SCL_PIN    14   // SSD1306 OLED SCL on GPIO 14
+#define I2C_SDA_PIN     15
+#define I2C_SCL_PIN     14
 
-// MPU-6050 IMU Pins (Dedicated Hardware I2C Bus 1 - Separate from OLED!)
-#define MPU_SDA_PIN     13   // MPU-6050 SDA on GPIO 13
-#define MPU_SCL_PIN     2    // MPU-6050 SCL on GPIO 2
+// MPU-6050 Motion Sensor Pins (Hardware Wire1 Bus 1)
+#define MPU_SDA_PIN     13   // MPU6050 SDA on GPIO 13
+#define MPU_SCL_PIN      2   // MPU6050 SCL on GPIO 2
 
 // Push Button Pin (Dedicated GPIO)
 #define BUTTON_PIN      12   // Push button on GPIO 12 (INPUT_PULLUP)
@@ -60,18 +95,29 @@
 
 // NEO-M8N GPS Module Pins (Hardware UART2)
 #define GPS_RX_PIN      16   // NEO-M8N TX -> ESP32 GPIO 16 (U2RXD)
-#define GPS_TX_PIN      17   // NEO-M8N RX -> ESP32 GPIO 17 (TX2)
+#define GPS_TX_PIN      -1   // NEO-M8N RX -> Unused
 #define GPS_BAUD        9600
 
 #define MPU6050_ADDR         0x68
+#define MPU6050_CONFIG       0x1A // DLPF (Digital Low Pass Filter) register
+#define MPU6050_ACCEL_CONFIG 0x1C // Accelerometer full-scale range register
 #define MPU6050_PWR_MGMT_1   0x6B
 #define MPU6050_ACCEL_XOUT_H 0x3B
 
+// Calibrated Thresholds & Filters for Vehicle & Motorcycle Safety
+#define MPU_ACCEL_SCALE         4096.0f  // ±8g sensitivity: 4096 LSB/g (covers road impacts without saturation)
+#define CRASH_THRESHOLD_G       6.5f     // Genuine vehicular crash impact threshold (>6.5G)
+#define CRASH_SAMPLES_REQ       3        // Multi-sample debounce (3 consecutive 50ms reads > threshold)
+#define FALL_ANGLE_DEG          65.0f    // Motorcycle fall tilt threshold (>65° lean angle; normal riding max ~45°-50°)
+#define FALL_SUSTAIN_MS         2500     // Must remain fallen for 2.5 seconds (prevents false trigger on quick bumps/turns)
+#define TAMPER_THRESHOLD_G      0.45f    // Guard armed motion threshold
+
 // ---------------------- Peripherals Initialization ----------------------
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-TwoWire WireMPU = TwoWire(1); // Dedicated 2nd hardware I2C bus for MPU-6050
 WebServer server(80);
+#if ENABLE_BLUETOOTH
 BluetoothSerial SerialBT;
+#endif
 HardwareSerial SerialGPS(2);
 TinyGPSPlus gps;
 
@@ -82,7 +128,7 @@ const char* apPassword = "drivesphere123";
 // ---------------------- State & Telemetry ----------------------
 String currentLine1 = "DRIVESPHERE";
 String currentLine2 = "SYSTEM READY";
-String currentGlyph = "IDLE";
+String currentGlyph = "IDLE_FACE";
 int currentSpeed = 0;
 int currentScore = 92;
 String vehicleMode = "BIKE"; // "BIKE" or "CAR"
@@ -90,9 +136,23 @@ String vehicleMode = "BIKE"; // "BIKE" or "CAR"
 bool isSosTriggered = false;
 bool isTamperDetected = false;
 bool isVehicleGuardArmed = false;
-int activeDisplayMode = 0; // 0: Main HUD, 1: Idle Screen, 2: Telemetry, 3: Glyph Matrix
+int activeDisplayMode = 0; // 0: Aero HUD, 1: Map Nav, 2: Guard Visor, 3: Telemetry, 4: Full Glyph
+
+// OLED Hardware Configuration
+int chosenSda = 15;
+int chosenScl = 14;
+byte activeOledAddr = 0x3C;
+bool oledFound = false;
+
+// Turn-by-Turn GPS Map Navigation State (Matches 128x64 OLED Layout)
+String navManeuver = "STRAIGHT"; // "STRAIGHT", "TURN_LEFT", "TURN_RIGHT", "UTURN", "DESTINATION"
+String navDistance = "0 m";
+String navEta = "5 min - 2.2km - 11:52";
+String navStreet = "Trung Lap 7";
+bool isNavActive = false;
 
 // MPU-6050 Telemetry
+uint8_t activeMpuAddr = 0x68;
 bool mpuAvailable = false;
 float currentLeanAngle = 0.0; // Roll in degrees
 float currentPitch = 0.0;     // Pitch in degrees
@@ -102,6 +162,8 @@ float peakCrashG = 0.0;       // Latched peak impact shock G
 float peakTiltDeg = 0.0;      // Latched peak fall tilt angle
 unsigned long lastMotionTime = 0; // Timestamp of last detected motion
 unsigned long lastMpuReadTime = 0;
+unsigned long fallStartTime = 0;  // Debounce timer for sustained fall angle
+int crashHitCount = 0;            // Consecutive high-G samples counter
 
 // NEO-M8N GPS Telemetry
 double currentGpsLat = 0.0;
@@ -133,27 +195,223 @@ volatile bool btPairingSuccess = false;
 unsigned long btAuthCompleteTime = 0;
 volatile bool btPairingNeedsUpdate = false;
 
-// ---------------------- MPU-6050 Routines (Dedicated Bus 1) ----------------------
-void initMPU6050() {
-  WireMPU.begin(MPU_SDA_PIN, MPU_SCL_PIN);
-  WireMPU.beginTransmission(MPU6050_ADDR);
-  WireMPU.write(MPU6050_PWR_MGMT_1);
-  WireMPU.write(0); // Wake up MPU-6050 (clears sleep bit)
-  byte error = WireMPU.endTransmission();
-  if (error == 0) {
-    mpuAvailable = true;
-    Serial.println(F("[DriveSphere] MPU6050 IMU initialized on dedicated Wire1 (SDA:13, SCL:2)"));
+// ---------------------- Hardware Flashlight & Camera ----------------------
+void setFlashBrightness(int duty) {
+  duty = constrain(duty, 0, 255);
+  flashBrightness = duty;
+  ledcWrite(FLASH_LED_PIN, duty);
+}
+
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = CAM_Y2_GPIO_NUM;
+  config.pin_d1       = CAM_Y3_GPIO_NUM;
+  config.pin_d2       = CAM_Y4_GPIO_NUM;
+  config.pin_d3       = CAM_Y5_GPIO_NUM;
+  config.pin_d4       = CAM_Y6_GPIO_NUM;
+  config.pin_d5       = CAM_Y7_GPIO_NUM;
+  config.pin_d6       = CAM_Y8_GPIO_NUM;
+  config.pin_d7       = CAM_Y9_GPIO_NUM;
+  config.pin_xclk     = CAM_XCLK_GPIO_NUM;
+  config.pin_pclk     = CAM_PCLK_GPIO_NUM;
+  config.pin_vsync    = CAM_VSYNC_GPIO_NUM;
+  config.pin_href     = CAM_HREF_GPIO_NUM;
+  config.pin_sccb_sda = CAM_SIOD_GPIO_NUM;
+  config.pin_sccb_scl = CAM_SIOC_GPIO_NUM;
+  config.pin_pwdn     = CAM_PWDN_GPIO_NUM;
+  config.pin_reset    = CAM_RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    Serial.println(F("[DriveSphere Cam] PSRAM detected. Configuring VGA high-speed buffers."));
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
-    // Try alternate address 0x69
-    WireMPU.beginTransmission(0x69);
-    WireMPU.write(MPU6050_PWR_MGMT_1);
-    WireMPU.write(0);
-    if (WireMPU.endTransmission() == 0) {
-      mpuAvailable = true;
-      Serial.println(F("[DriveSphere] MPU6050 IMU initialized on 0x69 on dedicated Wire1"));
+    Serial.println(F("[DriveSphere Cam] DRAM mode (No PSRAM). Using QVGA resolution."));
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 14;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[DriveSphere Cam] Camera init failed: 0x%x\n", err);
+    cameraFound = false;
+    return false;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+    camSensorPid = s->id.PID;
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    s->set_vflip(s, 0);
+    s->set_hmirror(s, 0);
+  }
+
+  cameraFound = true;
+  Serial.printf("[DriveSphere Cam] OV2640 Initialized! Sensor PID: 0x%02X\n", camSensorPid);
+  return true;
+}
+
+// ---------------------- MPU-6050 Routines (Software I2C on SDA=13, SCL=2) ----------------------
+// Avoids hardware I2C port 1 conflict with the OV2640 camera driver
+static void bb_i2c_delay() {
+  delayMicroseconds(4);
+}
+
+static void bb_i2c_start() {
+  pinMode(MPU_SDA_PIN, INPUT_PULLUP);
+  pinMode(MPU_SCL_PIN, INPUT_PULLUP);
+  bb_i2c_delay();
+  pinMode(MPU_SDA_PIN, OUTPUT);
+  digitalWrite(MPU_SDA_PIN, LOW);
+  bb_i2c_delay();
+  pinMode(MPU_SCL_PIN, OUTPUT);
+  digitalWrite(MPU_SCL_PIN, LOW);
+  bb_i2c_delay();
+}
+
+static void bb_i2c_stop() {
+  pinMode(MPU_SDA_PIN, OUTPUT);
+  digitalWrite(MPU_SDA_PIN, LOW);
+  bb_i2c_delay();
+  pinMode(MPU_SCL_PIN, INPUT_PULLUP);
+  bb_i2c_delay();
+  pinMode(MPU_SDA_PIN, INPUT_PULLUP);
+  bb_i2c_delay();
+}
+
+static bool bb_i2c_write(uint8_t data) {
+  for (int i = 0; i < 8; i++) {
+    if (data & 0x80) {
+      pinMode(MPU_SDA_PIN, INPUT_PULLUP);
     } else {
-      Serial.println(F("[DriveSphere] MPU6050 not responding on dedicated Wire1 (SDA:13, SCL:2); continuing"));
+      pinMode(MPU_SDA_PIN, OUTPUT);
+      digitalWrite(MPU_SDA_PIN, LOW);
     }
+    data <<= 1;
+    bb_i2c_delay();
+    pinMode(MPU_SCL_PIN, INPUT_PULLUP);
+    bb_i2c_delay();
+    pinMode(MPU_SCL_PIN, OUTPUT);
+    digitalWrite(MPU_SCL_PIN, LOW);
+    bb_i2c_delay();
+  }
+  // Read ACK
+  pinMode(MPU_SDA_PIN, INPUT_PULLUP);
+  bb_i2c_delay();
+  pinMode(MPU_SCL_PIN, INPUT_PULLUP);
+  bb_i2c_delay();
+  bool ack = (digitalRead(MPU_SDA_PIN) == LOW);
+  pinMode(MPU_SCL_PIN, OUTPUT);
+  digitalWrite(MPU_SCL_PIN, LOW);
+  bb_i2c_delay();
+  return ack;
+}
+
+static uint8_t bb_i2c_read(bool ack) {
+  uint8_t data = 0;
+  pinMode(MPU_SDA_PIN, INPUT_PULLUP);
+  for (int i = 0; i < 8; i++) {
+    data <<= 1;
+    pinMode(MPU_SCL_PIN, INPUT_PULLUP);
+    bb_i2c_delay();
+    if (digitalRead(MPU_SDA_PIN) == HIGH) data |= 1;
+    pinMode(MPU_SCL_PIN, OUTPUT);
+    digitalWrite(MPU_SCL_PIN, LOW);
+    bb_i2c_delay();
+  }
+  if (ack) {
+    pinMode(MPU_SDA_PIN, OUTPUT);
+    digitalWrite(MPU_SDA_PIN, LOW);
+  } else {
+    pinMode(MPU_SDA_PIN, INPUT_PULLUP);
+  }
+  bb_i2c_delay();
+  pinMode(MPU_SCL_PIN, INPUT_PULLUP);
+  bb_i2c_delay();
+  pinMode(MPU_SCL_PIN, OUTPUT);
+  digitalWrite(MPU_SCL_PIN, LOW);
+  pinMode(MPU_SDA_PIN, INPUT_PULLUP);
+  bb_i2c_delay();
+  return data;
+}
+
+static bool bb_mpu_write_reg(uint8_t addr, uint8_t reg, uint8_t val) {
+  bb_i2c_start();
+  if (!bb_i2c_write((addr << 1) | 0)) { bb_i2c_stop(); return false; }
+  if (!bb_i2c_write(reg)) { bb_i2c_stop(); return false; }
+  if (!bb_i2c_write(val)) { bb_i2c_stop(); return false; }
+  bb_i2c_stop();
+  return true;
+}
+
+static bool bb_mpu_read_bytes(uint8_t addr, uint8_t reg, uint8_t* buf, int len) {
+  bb_i2c_start();
+  if (!bb_i2c_write((addr << 1) | 0)) { bb_i2c_stop(); return false; }
+  if (!bb_i2c_write(reg)) { bb_i2c_stop(); return false; }
+  bb_i2c_start(); // Repeated start
+  if (!bb_i2c_write((addr << 1) | 1)) { bb_i2c_stop(); return false; }
+  for (int i = 0; i < len; i++) {
+    buf[i] = bb_i2c_read(i < len - 1);
+  }
+  bb_i2c_stop();
+  return true;
+}
+
+void initMPU6050() {
+  pinMode(MPU_SDA_PIN, INPUT_PULLUP);
+  pinMode(MPU_SCL_PIN, INPUT_PULLUP);
+
+  auto configSensor = [](uint8_t addr) -> bool {
+    // 1. Wake up MPU-6050 (0x6B = 0x01)
+    if (!bb_mpu_write_reg(addr, MPU6050_PWR_MGMT_1, 0x01)) return false;
+    // 2. Configure DLPF to 44Hz (0x1A = 0x03)
+    if (!bb_mpu_write_reg(addr, MPU6050_CONFIG, 0x03)) return false;
+    // 3. Configure Accelerometer Full-Scale Range to ±8g (0x1C = 0x10)
+    if (!bb_mpu_write_reg(addr, MPU6050_ACCEL_CONFIG, 0x10)) return false;
+    return true;
+  };
+
+  if (configSensor(0x68)) {
+    activeMpuAddr = 0x68;
+    mpuAvailable = true;
+    Serial.printf("[DriveSphere] MPU6050 IMU initialized at 0x68 on SDA=%d, SCL=%d!\n", MPU_SDA_PIN, MPU_SCL_PIN);
+  } else if (configSensor(0x69)) {
+    activeMpuAddr = 0x69;
+    mpuAvailable = true;
+    Serial.printf("[DriveSphere] MPU6050 IMU initialized at alternate 0x69 on SDA=%d, SCL=%d!\n", MPU_SDA_PIN, MPU_SCL_PIN);
+  } else {
+    Serial.printf("[DriveSphere] Scanning I2C on SDA=%d, SCL=%d: ", MPU_SDA_PIN, MPU_SCL_PIN);
+    int detected = 0;
+    for (byte a = 1; a < 127; a++) {
+      bb_i2c_start();
+      bool ack = bb_i2c_write((a << 1) | 0);
+      bb_i2c_stop();
+      if (ack) {
+        Serial.printf("0x%02X ", a);
+        detected++;
+        if (a == 0x68 || a == 0x69) {
+          activeMpuAddr = a;
+          mpuAvailable = configSensor(a);
+        }
+      }
+    }
+    if (detected == 0) Serial.print("NONE (Check SDA=13, SCL=2, VCC, GND)");
+    Serial.println();
   }
 }
 
@@ -162,60 +420,82 @@ void readMPU6050() {
   if (millis() - lastMpuReadTime < 50) return; // 20 Hz sample rate
   lastMpuReadTime = millis();
 
-  WireMPU.beginTransmission(MPU6050_ADDR);
-  WireMPU.write(MPU6050_ACCEL_XOUT_H);
-  if (WireMPU.endTransmission(false) != 0) return;
+  uint8_t raw[14];
+  if (!bb_mpu_read_bytes(activeMpuAddr, MPU6050_ACCEL_XOUT_H, raw, 14)) return;
 
-  if (WireMPU.requestFrom((uint16_t)MPU6050_ADDR, (uint8_t)14, true) == 14) {
-    int16_t ax = (WireMPU.read() << 8) | WireMPU.read();
-    int16_t ay = (WireMPU.read() << 8) | WireMPU.read();
-    int16_t az = (WireMPU.read() << 8) | WireMPU.read();
-    int16_t temp = (WireMPU.read() << 8) | WireMPU.read();
-    int16_t gx = (WireMPU.read() << 8) | WireMPU.read();
-    int16_t gy = (WireMPU.read() << 8) | WireMPU.read();
-    int16_t gz = (WireMPU.read() << 8) | WireMPU.read();
+  int16_t ax = (raw[0] << 8) | raw[1];
+  int16_t ay = (raw[2] << 8) | raw[3];
+  int16_t az = (raw[4] << 8) | raw[5];
+  int16_t temp = (raw[6] << 8) | raw[7];
+  int16_t gx = (raw[8] << 8) | raw[9];
+  int16_t gy = (raw[10] << 8) | raw[11];
+  int16_t gz = (raw[12] << 8) | raw[13];
 
-    float ax_g = (float)ax / 16384.0f;
-    float ay_g = (float)ay / 16384.0f;
-    float az_g = (float)az / 16384.0f;
+    // Scale raw values using ±8g factor (4096 LSB/g)
+    float ax_g = (float)ax / MPU_ACCEL_SCALE;
+    float ay_g = (float)ay / MPU_ACCEL_SCALE;
+    float az_g = (float)az / MPU_ACCEL_SCALE;
     currentAccelG = sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
 
-    // Roll (motorcycle lean angle in degrees)
-    currentLeanAngle = atan2(ay_g, az_g) * 180.0f / 3.14159265f;
+    // Roll (motorcycle lean angle in degrees) with exponential moving average smoothing
+    float rawLeanAngle = atan2(ay_g, az_g) * 180.0f / 3.14159265f;
+    currentLeanAngle = 0.80f * currentLeanAngle + 0.20f * rawLeanAngle;
+
     // Pitch (elevation angle in degrees)
     currentPitch = atan2(-ax_g, sqrt(ay_g * ay_g + az_g * az_g)) * 180.0f / 3.14159265f;
 
-    // Automatic Fall Detection: Motorcycle tilted > 55 deg
-    if (vehicleMode == "BIKE" && abs(currentLeanAngle) > 55.0f) {
-      if (abs(currentLeanAngle) > peakTiltDeg) peakTiltDeg = abs(currentLeanAngle);
-      if (!isSosTriggered) {
-        isSosTriggered = true;
-        isCrashDetected = true;
-        SerialBT.println("{\"event\":\"FALL\",\"sosTriggered\":true}");
+    // Automatic Fall Detection: Motorcycle tilted > 65 deg SUSTAINED for 2.5 seconds
+    // CRITICAL FIX: Only armed during active riding motion (speed >= 5 km/h or GPS moving).
+    // Prevents false alarms when picking up device, handling it in hand, on desk, or on kickstand.
+    bool isRidingMotion = (currentSpeed >= 5) || (currentGpsSpeedKmH >= 5.0f);
+
+    if (vehicleMode == "BIKE" && isRidingMotion && abs(currentLeanAngle) > FALL_ANGLE_DEG) {
+      if (fallStartTime == 0) {
+        fallStartTime = millis();
+      } else if (millis() - fallStartTime >= FALL_SUSTAIN_MS) {
+        if (abs(currentLeanAngle) > peakTiltDeg) peakTiltDeg = abs(currentLeanAngle);
+        if (!isSosTriggered) {
+          isSosTriggered = true;
+          isCrashDetected = true;
+#if ENABLE_BLUETOOTH
+          SerialBT.println("{\"event\":\"FALL\",\"sosTriggered\":true}");
+#endif
+          Serial.printf("[DriveSphere Safety] DYNAMIC RIDE FALL DETECTED! Lean=%.1f deg, Speed=%d km/h. S.O.S TRIGGERED.\n", currentLeanAngle, currentSpeed);
+        }
       }
+    } else {
+      fallStartTime = 0; // Bike is upright, recovered, or stationary/parked; cancel timer
     }
     if (isCrashDetected && abs(currentLeanAngle) > peakTiltDeg) {
       peakTiltDeg = abs(currentLeanAngle);
     }
 
-    // High-G Impact Crash Detection (> 3.5 G shock)
-    if (currentAccelG > 3.5f) {
-      if (currentAccelG > peakCrashG) peakCrashG = currentAccelG;
-      if (!isSosTriggered) {
-        isSosTriggered = true;
-        isCrashDetected = true;
-        SerialBT.println("{\"event\":\"CRASH\",\"sosTriggered\":true}");
+    // High-G Impact Crash Detection (> 6.5 G shock sustained across 3 consecutive samples)
+    // Requires either active vehicle motion or extreme impact shock (> 8.0G) to eliminate handling noise
+    if (currentAccelG > CRASH_THRESHOLD_G && (isRidingMotion || currentAccelG > 8.0f)) {
+      crashHitCount++;
+      if (crashHitCount >= CRASH_SAMPLES_REQ) {
+        if (currentAccelG > peakCrashG) peakCrashG = currentAccelG;
+        if (!isSosTriggered) {
+          isSosTriggered = true;
+          isCrashDetected = true;
+#if ENABLE_BLUETOOTH
+          SerialBT.println("{\"event\":\"CRASH\",\"sosTriggered\":true}");
+#endif
+          Serial.printf("[DriveSphere Safety] CRASH IMPACT DETECTED! G=%.2f. S.O.S TRIGGERED.\n", currentAccelG);
+        }
       }
+    } else {
+      crashHitCount = 0;
     }
     if (isCrashDetected && currentAccelG > peakCrashG) {
       peakCrashG = currentAccelG;
     }
 
     // Anti-Theft Tamper Motion Detection
-    if (isVehicleGuardArmed && abs(currentAccelG - 1.0f) > 0.35f) {
+    if (isVehicleGuardArmed && abs(currentAccelG - 1.0f) > TAMPER_THRESHOLD_G) {
       isTamperDetected = true;
     }
-  }
 }
 
 unsigned long totalGpsChars = 0;
@@ -223,11 +503,13 @@ unsigned long lastGpsDebugTime = 0;
 
 // ---------------------- NEO-M8N GPS Routines ----------------------
 void readGPS() {
+#if GPS_RX_PIN >= 0
   while (SerialGPS.available() > 0) {
     char c = SerialGPS.read();
     totalGpsChars++;
     gps.encode(c);
   }
+#endif
 
   if (gps.location.isValid()) {
     currentGpsLat = gps.location.lat();
@@ -260,7 +542,7 @@ void readGPS() {
     Serial.print(F("[GPS CHECK] Chars: "));
     Serial.print(totalGpsChars);
     if (totalGpsChars == 0) {
-      Serial.println(F(" -> NO DATA ON GPIO 16! Verify NEO-M8N TX -> ESP32 GPIO 16 & Power (5V/GND)."));
+      Serial.printf(" -> NO DATA ON GPIO %d (PSRAM-Safe Pin). Connect NEO-M8N TX -> ESP32 GPIO %d & 5V/GND.\n", GPS_RX_PIN, GPS_RX_PIN);
     } else {
       Serial.print(F(" | Sats: "));
       Serial.print(currentGpsSats);
@@ -342,11 +624,17 @@ void drawHeader() {
   display.print(vehicleMode == "BIKE" ? "BIKE" : "CAR");
 
   // 2. Connectivity Icon & Status (Center)
+#if ENABLE_BLUETOOTH
   drawBluetoothIcon(46, 0, SerialBT.hasClient());
   display.setCursor(55, 1);
   if (SerialBT.hasClient()) {
     display.print("LINK");
-  } else if (WiFi.softAPgetStationNum() > 0) {
+  } else
+#else
+  drawBluetoothIcon(46, 0, false);
+  display.setCursor(55, 1);
+#endif
+  if (WiFi.softAPgetStationNum() > 0) {
     display.print("WIFI");
   } else {
     display.print("RDY");
@@ -372,18 +660,19 @@ void drawHeader() {
 }
 
 void drawPagination(int activePage) {
-  for (int i = 0; i < 4; i++) {
+  int dotY = (activePage == 4) ? 62 : 57;
+  for (int i = 0; i < 5; i++) {
     if (i == activePage) {
-      display.fillCircle(110 + (i * 4), 57, 1, SSD1306_WHITE);
+      display.fillCircle(103 + (i * 5), dotY, 1, SSD1306_WHITE);
     } else {
-      display.drawPixel(110 + (i * 4), 57, SSD1306_WHITE);
+      display.drawPixel(103 + (i * 5), dotY, SSD1306_WHITE);
     }
   }
 }
 
 void drawCardPagination(int activePage) {
-  for (int i = 0; i < 4; i++) {
-    int y = 51 + (i * 3);
+  for (int i = 0; i < 3; i++) {
+    int y = 52 + (i * 4);
     if (i == activePage) {
       display.fillRect(63, y, 2, 2, SSD1306_WHITE);
     } else {
@@ -397,6 +686,8 @@ void clearSos() {
   isCrashDetected = false;
   peakCrashG = 0.0f;
   peakTiltDeg = 0.0f;
+  fallStartTime = 0;
+  crashHitCount = 0;
   updateOLED();
 }
 
@@ -459,34 +750,168 @@ void renderSosScreen() {
   display.display();
 }
 
+// ---------------------- Turn-by-Turn GPS Map Navigation HUD ----------------------
+void drawNavArrow(int x, int y, const String& maneuver) {
+  String m = maneuver;
+  m.toUpperCase();
+  m.trim();
+
+  // Crisp, thick-line vector arrows tailored for 128x64 high contrast readability
+  if (m == "TURN_LEFT" || m == "LEFT") {
+    // 90-degree left turn arrow
+    display.fillTriangle(x + 2, y + 15, x + 13, y + 6, x + 13, y + 24, SSD1306_WHITE);
+    display.fillRect(x + 13, y + 11, 10, 8, SSD1306_WHITE);
+    display.fillRect(x + 17, y + 19, 6, 9, SSD1306_WHITE);
+  } else if (m == "SLIGHT_LEFT" || m == "FORK_LEFT") {
+    // 45-degree slight left turn arrow
+    display.fillTriangle(x + 4, y + 6, x + 15, y + 4, x + 7, y + 17, SSD1306_WHITE);
+    display.drawLine(x + 8, y + 13, x + 19, y + 24, SSD1306_WHITE);
+    display.drawLine(x + 9, y + 13, x + 20, y + 24, SSD1306_WHITE);
+    display.drawLine(x + 10, y + 13, x + 21, y + 24, SSD1306_WHITE);
+    display.drawLine(x + 11, y + 13, x + 22, y + 24, SSD1306_WHITE);
+  } else if (m == "SHARP_LEFT") {
+    // Acute 135-degree hairpin left turn arrow
+    display.fillTriangle(x + 4, y + 22, x + 14, y + 14, x + 14, y + 28, SSD1306_WHITE);
+    display.drawRoundRect(x + 12, y + 4, 14, 18, 5, SSD1306_WHITE);
+    display.drawRoundRect(x + 13, y + 5, 12, 16, 4, SSD1306_WHITE);
+  } else if (m == "TURN_RIGHT" || m == "RIGHT") {
+    // 90-degree right turn arrow
+    display.fillTriangle(x + 28, y + 15, x + 17, y + 6, x + 17, y + 24, SSD1306_WHITE);
+    display.fillRect(x + 7, y + 11, 10, 8, SSD1306_WHITE);
+    display.fillRect(x + 7, y + 19, 6, 9, SSD1306_WHITE);
+  } else if (m == "SLIGHT_RIGHT" || m == "FORK_RIGHT") {
+    // 45-degree slight right turn arrow
+    display.fillTriangle(x + 26, y + 6, x + 15, y + 4, x + 23, y + 17, SSD1306_WHITE);
+    display.drawLine(x + 22, y + 13, x + 11, y + 24, SSD1306_WHITE);
+    display.drawLine(x + 21, y + 13, x + 10, y + 24, SSD1306_WHITE);
+    display.drawLine(x + 20, y + 13, x + 9, y + 24, SSD1306_WHITE);
+    display.drawLine(x + 19, y + 13, x + 8, y + 24, SSD1306_WHITE);
+  } else if (m == "SHARP_RIGHT") {
+    // Acute 135-degree hairpin right turn arrow
+    display.fillTriangle(x + 26, y + 22, x + 16, y + 14, x + 16, y + 28, SSD1306_WHITE);
+    display.drawRoundRect(x + 4, y + 4, 14, 18, 5, SSD1306_WHITE);
+    display.drawRoundRect(x + 5, y + 5, 12, 16, 4, SSD1306_WHITE);
+  } else if (m == "UTURN") {
+    // Sweeping U-turn arc
+    display.drawRoundRect(x + 6, y + 4, 18, 16, 8, SSD1306_WHITE);
+    display.drawRoundRect(x + 7, y + 5, 16, 14, 7, SSD1306_WHITE);
+    display.fillTriangle(x + 6, y + 26, x + 1, y + 17, x + 11, y + 17, SSD1306_WHITE);
+  } else if (m == "ROUNDABOUT" || m == "ROTARY") {
+    // Rotary circle with arrow
+    display.drawCircle(x + 15, y + 15, 10, SSD1306_WHITE);
+    display.drawCircle(x + 15, y + 15, 7, SSD1306_WHITE);
+    display.fillTriangle(x + 25, y + 10, x + 18, y + 6, x + 20, y + 16, SSD1306_WHITE);
+  } else if (m == "DESTINATION" || m == "ARRIVE") {
+    // Checkered destination target pin
+    display.fillCircle(x + 15, y + 9, 8, SSD1306_WHITE);
+    display.fillCircle(x + 15, y + 9, 3, SSD1306_BLACK);
+    display.fillTriangle(x + 8, y + 12, x + 22, y + 12, x + 15, y + 27, SSD1306_WHITE);
+  } else {
+    // STRAIGHT / FORWARD: Highway surge chevron arrow
+    display.fillTriangle(x + 15, y + 2, x + 4, y + 13, x + 26, y + 13, SSD1306_WHITE);
+    display.fillRect(x + 11, y + 15, 8, 4, SSD1306_WHITE);
+    display.fillRect(x + 11, y + 21, 8, 4, SSD1306_WHITE);
+    display.fillRect(x + 11, y + 27, 8, 3, SSD1306_WHITE);
+  }
+}
+
+// SCREEN 1: Turn-by-Turn GPS Map Navigation HUD (128x64 OLED)
+void renderNavigationScreen() {
+  display.clearDisplay();
+
+  // 1. Top Integrated HUD Header (Y: 0 to 9)
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.fillRoundRect(2, 0, 32, 9, 2, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(4, 1);
+  display.print("NAV");
+  display.setTextColor(SSD1306_WHITE);
+
+  // Speedometer Mini-Badge at Top Right (Rider always knows speed!)
+  display.setCursor(68, 1);
+  display.print("SPD: ");
+  display.print(currentSpeed);
+  display.print(" KPH");
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+  // 2. Left Section: 30x30 Bold Vector Maneuver Arrow (X: 3, Y: 12)
+  drawNavArrow(3, 12, navManeuver);
+
+  // Vertical Dotted Divider at X: 36 (Y: 11 to 45)
+  for (int y = 11; y <= 45; y += 2) {
+    display.drawPixel(36, y, SSD1306_WHITE);
+  }
+
+  // 3. Right Section: Distance Countdown & Turn Proximity
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(41, 13);
+  display.print(navDistance);
+
+  // Proximity Countdown Bar (Y: 31, X: 41 to 123, 82px)
+  display.drawRoundRect(41, 31, 83, 4, 1, SSD1306_WHITE);
+  int distMeters = 300;
+  if (navDistance.indexOf("km") != -1) distMeters = 1500;
+  else distMeters = navDistance.toInt();
+  int fillW = map(constrain(distMeters, 0, 500), 500, 0, 0, 79);
+  if (fillW > 0) display.fillRect(43, 32, fillW, 2, SSD1306_WHITE);
+
+  // ETA & Trip Remaining (Y: 37, X: 41)
+  display.setTextSize(1);
+  display.setCursor(41, 37);
+  display.print(navEta);
+
+  // Horizontal Separator Bar at Y: 46
+  display.drawFastHLine(0, 46, 128, SSD1306_WHITE);
+
+  // 4. Bottom Section: Next Turn Street Name (Smooth Auto-Scrolling Marquee)
+  String street = navStreet;
+  int streetLen = street.length();
+  if (streetLen <= 14) {
+    int startX = (128 - (streetLen * 6)) / 2;
+    if (startX < 2) startX = 2;
+    display.setCursor(startX, 52);
+    display.print(street);
+  } else {
+    int maxScroll = streetLen - 12;
+    int scrollOffset = ((millis() / 280) % (maxScroll + 4));
+    if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+    String sub = street.substring(scrollOffset, min(streetLen, scrollOffset + 14));
+    display.setCursor(4, 52);
+    display.print(sub);
+  }
+
+  // Discrete Page Indicator (Screen 1)
+  drawPagination(1);
+  display.display();
+}
+
 // SCREEN 0: Aero Digital Cluster HUD (128x64 High-Contrast Cockpit)
 void renderMainHUD() {
   display.clearDisplay();
   drawHeader();
 
-  // 1. Dynamic Full-Width Speed Ribbon (Y: 12 - 17)
+  // 1. Dynamic Full-Width Segmented Speed Ribbon (Y: 12 - 17)
   display.drawRoundRect(2, 12, 124, 5, 1, SSD1306_WHITE);
   int ribbonW = map(constrain(currentSpeed, 0, 120), 0, 120, 0, 120);
   if (ribbonW > 0) {
-    display.fillRect(4, 13, ribbonW, 3, SSD1306_WHITE);
+    bool flashRibbon = (currentSpeed > 75 && ((millis() / 150) % 2 == 0));
+    if (!flashRibbon) {
+      display.fillRect(4, 13, ribbonW, 3, SSD1306_WHITE);
+    }
   }
-  // Subtle speed tick marks below ribbon (0, 60, 120 km/h)
-  display.drawFastVLine(2, 17, 2, SSD1306_WHITE);
-  display.drawFastVLine(63, 17, 2, SSD1306_WHITE);
+  // Speed tick marks (0, 30, 60, 90, 120 km/h)
+  display.drawFastVLine(2,   17, 2, SSD1306_WHITE);
+  display.drawFastVLine(33,  17, 2, SSD1306_WHITE);
+  display.drawFastVLine(63,  17, 2, SSD1306_WHITE);
+  display.drawFastVLine(94,  17, 2, SSD1306_WHITE);
   display.drawFastVLine(125, 17, 2, SSD1306_WHITE);
 
   // 2. Hero Digital Speedometer Readout (Y: 20 - 47)
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(4);
-  // Calculate horizontal start position to center digits in the hero area (0 to 82)
-  int speedX = 30; // default for 1 digit
-  if (currentSpeed >= 100) {
-    speedX = 6;
-  } else if (currentSpeed >= 10) {
-    speedX = 18;
-  } else {
-    speedX = 30;
-  }
+  int speedX = (currentSpeed >= 100) ? 6 : (currentSpeed >= 10 ? 18 : 30);
   display.setCursor(speedX, 20);
   display.print(currentSpeed);
 
@@ -500,45 +925,43 @@ void renderMainHUD() {
   // Dynamic driving status pill
   display.drawRoundRect(85, 40, 39, 9, 2, SSD1306_WHITE);
   display.setCursor(88, 41);
-  if (currentSpeed > 80) {
+  if (currentSpeed > 75) {
     display.print("FAST");
   } else if (isVehicleGuardArmed) {
     display.print("ARM");
   } else {
-    display.print("LIVE");
+    display.print(vehicleMode == "BIKE" ? "RIDE" : "DRV");
   }
 
-  // 3. Bottom Telemetry Cards (Y: 50 - 63)
+  // 3. Bottom Telemetry Split Dashboard (Y: 50 - 63)
   if (isTamperDetected) {
-    // High-visibility inverted tamper alert banner
     display.fillRoundRect(1, 50, 126, 13, 2, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
     display.setCursor(10, 53);
     display.print("! TAMPER DETECTED !");
     display.setTextColor(SSD1306_WHITE);
   } else {
-    // Left Card: Lean Angle & Directional Indicator (60px wide)
+    // Left Card: Visual Spirit-Level Lean Angle Meter (60px wide)
     display.drawRoundRect(1, 50, 60, 13, 2, SSD1306_WHITE);
     display.setTextSize(1);
     if (vehicleMode == "BIKE") {
       float absLean = abs(currentLeanAngle);
+      display.setCursor(4, 53);
       if (absLean < 2.5f) {
-        display.setCursor(4, 53);
-        display.print("^ 0");
+        display.print("0");
         display.print((char)247);
-        display.print(" BAL");
+        display.print(" [|] BAL");
       } else if (currentLeanAngle < -2.5f) {
-        display.setCursor(4, 53);
-        display.print("< ");
+        display.print("<");
         display.print((int)absLean);
         display.print((char)247);
-        display.print(" L");
+        display.print(" L [.");
       } else {
-        display.setCursor(4, 53);
-        display.print("R ");
+        display.print("R.");
+        display.print("] ");
         display.print((int)absLean);
         display.print((char)247);
-        display.print(" >");
+        display.print(">");
       }
     } else {
       display.setCursor(4, 53);
@@ -551,8 +974,7 @@ void renderMainHUD() {
     display.drawRoundRect(67, 50, 60, 13, 2, SSD1306_WHITE);
     display.setCursor(70, 53);
     display.print(currentAccelG, 1);
-    display.print("G ");
-    display.print("SC:");
+    display.print("G SC:");
     display.print(currentScore);
 
     // Center pagination indicator
@@ -562,176 +984,351 @@ void renderMainHUD() {
   display.display();
 }
 
-// SCREEN 1: Idle Cockpit & System Standby (Parked / Stopped)
+// ---------------------- 14x12 Cyber Glyph Bitmaps (PROGMEM) ----------------------
+// Each uint16_t holds one 14-bit horizontal row (bit 13 is X=0, bit 0 is X=13)
+const uint16_t GLYPH_TURN_LEFT[12] PROGMEM = { 0x0380, 0x07C0, 0x0FE0, 0x1FF0, 0x0380, 0x0380, 0x0380, 0x03FC, 0x001C, 0x001C, 0x001C, 0x0000 };
+const uint16_t GLYPH_TURN_RIGHT[12] PROGMEM = { 0x0070, 0x00F8, 0x01FC, 0x03FE, 0x0070, 0x0070, 0x0070, 0x0FF0, 0x0E00, 0x0E00, 0x0E00, 0x0000 };
+const uint16_t GLYPH_STRAIGHT[12] PROGMEM = { 0x00E0, 0x01F0, 0x03F8, 0x07FC, 0x00E0, 0x00E0, 0x00E0, 0x00E0, 0x00E0, 0x00E0, 0x00E0, 0x0000 };
+const uint16_t GLYPH_IDLE_FACE[12] PROGMEM = { 0x0000, 0x0000, 0x0E1C, 0x1F3E, 0x1F3E, 0x0E1C, 0x0000, 0x0000, 0x0408, 0x03F0, 0x0000, 0x0000 };
+const uint16_t GLYPH_MAC[12] PROGMEM = { 0x0DB6, 0x0EDC, 0x0DB6, 0x0DB6, 0x0C06, 0x0DB6, 0x0EDC, 0x0DB6, 0x0000, 0x0000, 0x0000, 0x0000 };
+const uint16_t GLYPH_ARCO[12] PROGMEM = { 0x00C0, 0x03F0, 0x0FFC, 0x0C0C, 0x0C0C, 0x0FFC, 0x07F8, 0x03F0, 0x01E0, 0x00C0, 0x0000, 0x0000 };
+const uint16_t GLYPH_PC[12] PROGMEM = { 0x0FFC, 0x0804, 0x0804, 0x0804, 0x0FFC, 0x00C0, 0x03F0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 };
+const uint16_t GLYPH_CUP[12] PROGMEM = { 0x0000, 0x01E0, 0x0210, 0x0408, 0x0408, 0x0210, 0x01E0, 0x0000, 0x0000, 0x0380, 0x01C0, 0x0000 };
+const uint16_t GLYPH_ROCKET[12] PROGMEM = { 0x00C0, 0x01E0, 0x03F0, 0x03F0, 0x07F8, 0x06D8, 0x06D8, 0x0F3C, 0x0C0C, 0x0408, 0x0000, 0x0000 };
+const uint16_t GLYPH_SUN[12] PROGMEM = { 0x0248, 0x01E0, 0x0BF4, 0x07F8, 0x0BF4, 0x07F8, 0x0BF4, 0x01E0, 0x0248, 0x0000, 0x0000, 0x0000 };
+const uint16_t GLYPH_CLOUD[12] PROGMEM = { 0x0000, 0x0000, 0x00F0, 0x03FC, 0x07FE, 0x0FFF, 0x0FFF, 0x07FE, 0x0000, 0x0000, 0x0000, 0x0000 };
+const uint16_t GLYPH_BATTERY_FULL[12] PROGMEM = { 0x0000, 0x0000, 0x0FFC, 0x0806, 0x0BF6, 0x0BF6, 0x0BF6, 0x0806, 0x0FFC, 0x0000, 0x0000, 0x0000 };
+const uint16_t GLYPH_BATTERY_HALF[12] PROGMEM = { 0x0000, 0x0000, 0x0FFC, 0x0806, 0x0B86, 0x0B86, 0x0B86, 0x0806, 0x0FFC, 0x0000, 0x0000, 0x0000 };
+const uint16_t GLYPH_BATTERY_EMPTY[12] PROGMEM = { 0x0000, 0x0000, 0x0FFC, 0x0806, 0x0806, 0x0806, 0x0806, 0x0806, 0x0FFC, 0x0000, 0x0000, 0x0000 };
+const uint16_t GLYPH_SHIELD[12] PROGMEM = { 0x0FFC, 0x1FFE, 0x1E7A, 0x1CE6, 0x1CE6, 0x1E7A, 0x0E70, 0x07E0, 0x03C0, 0x0180, 0x0000, 0x0000 };
+const uint16_t GLYPH_ALERT[12] PROGMEM = { 0x00C0, 0x01E0, 0x0330, 0x0668, 0x0668, 0x0C4C, 0x0C4C, 0x1806, 0x1806, 0x1806, 0x3FFE, 0x1FFC };
+
+const uint16_t* getGlyphBitmap(const String& name) {
+  String upper = name;
+  upper.toUpperCase();
+  upper.trim();
+
+  if (upper == "TURN_LEFT" || upper == "LEFT") return GLYPH_TURN_LEFT;
+  if (upper == "TURN_RIGHT" || upper == "RIGHT") return GLYPH_TURN_RIGHT;
+  if (upper == "STRAIGHT" || upper == "NAV" || upper == "FORWARD") return GLYPH_STRAIGHT;
+  if (upper == "IDLE_FACE" || upper == "IDLE" || upper == "FACE") return GLYPH_IDLE_FACE;
+  if (upper == "MAC" || upper == "APPLE") return GLYPH_MAC;
+  if (upper == "ARCO" || upper == "CIRCLE") return GLYPH_ARCO;
+  if (upper == "PC" || upper == "COMPUTER") return GLYPH_PC;
+  if (upper == "CUP" || upper == "COFFEE") return GLYPH_CUP;
+  if (upper == "ROCKET") return GLYPH_ROCKET;
+  if (upper == "SUN") return GLYPH_SUN;
+  if (upper == "CLOUD") return GLYPH_CLOUD;
+  if (upper == "BATTERY_FULL") return GLYPH_BATTERY_FULL;
+  if (upper == "BATTERY_HALF") return GLYPH_BATTERY_HALF;
+  if (upper == "BATTERY_EMPTY") return GLYPH_BATTERY_EMPTY;
+  if (upper == "SHIELD" || upper == "GUARD") return GLYPH_SHIELD;
+  if (upper == "ALERT" || upper == "WARNING" || upper == "HAZARD") return GLYPH_ALERT;
+
+  return GLYPH_IDLE_FACE;
+}
+
+void drawGlyphMatrix(int originX, int originY, const uint16_t* bitmap, bool animate, bool fullScreen = false) {
+  if (!bitmap) return;
+
+  unsigned long now = millis();
+  String upper = currentGlyph;
+  upper.toUpperCase();
+  upper.trim();
+
+  // Animation states for all individual glyphs
+  bool isIdleFace = (upper == "IDLE_FACE" || upper == "IDLE" || upper == "FACE");
+  bool isRocket   = (upper == "ROCKET");
+  bool isLeft     = (upper == "TURN_LEFT" || upper == "LEFT");
+  bool isRight    = (upper == "TURN_RIGHT" || upper == "RIGHT");
+  bool isStraight = (upper == "STRAIGHT" || upper == "NAV" || upper == "FORWARD");
+  bool isShield   = (upper == "SHIELD" || upper == "GUARD");
+  bool isAlert    = (upper == "ALERT" || upper == "WARNING");
+  bool isSun      = (upper == "SUN");
+  bool isCloud    = (upper == "CLOUD" || upper == "RAIN");
+  bool isCup      = (upper == "CUP" || upper == "COFFEE");
+  bool isBattery  = upper.startsWith("BATTERY");
+  bool isArco     = (upper == "ARCO" || upper == "CIRCLE");
+  bool isPC       = (upper == "MAC" || upper == "PC" || upper == "COMPUTER");
+
+  // Dynamic animation clock triggers
+  bool blink = animate && isIdleFace && ((now % 3400) < 180);
+  bool wink  = animate && isIdleFace && ((now % 6800) > 3400 && (now % 6800) < 3600);
+  int rocketFlameStep = (now / 70) % 3;
+  int leftChevronPhase = (now / 130) % 4;
+  int rightChevronPhase = (now / 130) % 4;
+  int straightPhase = (now / 110) % 4;
+  int shieldScanRow = (now / 90) % 12;
+  bool alertPhase = ((now / 200) % 2) == 0;
+  bool sunFlare = ((now / 250) % 2) == 0;
+  int rainStep = (now / 140) % 4;
+  int steamStep = (now / 160) % 4;
+  int chargeStep = (now / 300) % 5;
+  int arcoSweep = (now / 120) % 8;
+  bool pcCursor = ((now / 350) % 2) == 0;
+
+  // Layout metrics (Full-screen fills 128x64 edge-to-edge; compact centered HUD mode fits 70x48)
+  int colPitch = fullScreen ? 9 : 5;
+  int rowPitch = fullScreen ? 5 : 4;
+  int ledW     = fullScreen ? 7 : 4;
+  int ledH     = fullScreen ? 4 : 3;
+
+  for (int r = 0; r < 12; r++) {
+    uint16_t rowBits = pgm_read_word(&bitmap[r]);
+    int y = originY + (r * rowPitch);
+
+    for (int c = 0; c < 14; c++) {
+      bool bitOn = (rowBits >> (13 - c)) & 1;
+      int x = originX + (c * colPitch);
+
+      if (animate) {
+        // 1. IDLE_FACE: Eyes blink naturally, wink periodically
+        if (isIdleFace) {
+          if ((blink && (r == 3 || r == 4) && ((c >= 1 && c <= 5) || (c >= 8 && c <= 12))) ||
+              (wink  && (r == 3 || r == 4) && (c >= 1 && c <= 5))) {
+            if (r == 3) display.drawFastHLine(x, y + 1, ledW, SSD1306_WHITE);
+            continue;
+          }
+        }
+        // 2. ROCKET: Dynamic multi-stage flickering booster flames
+        else if (isRocket && (r >= 8)) {
+          if (r == 8 && (c == 6 || c == 7)) bitOn = true;
+          if (r == 9 && (c >= 5 && c <= 8)) bitOn = (rocketFlameStep != 0);
+          if (r >= 10 && (c == 6 || c == 7)) bitOn = (rocketFlameStep == 2);
+        }
+        // 3. TURN_LEFT: Running sequential chevron wave marching left
+        else if (isLeft && bitOn) {
+          int wave = (c + leftChevronPhase) % 3;
+          if (wave == 0) bitOn = false; // Flow gap
+        }
+        // 4. TURN_RIGHT: Running sequential chevron wave marching right
+        else if (isRight && bitOn) {
+          int wave = (13 - c + rightChevronPhase) % 3;
+          if (wave == 0) bitOn = false;
+        }
+        // 5. STRAIGHT: Surging forward wave
+        else if (isStraight && bitOn) {
+          int wave = (11 - r + straightPhase) % 4;
+          if (wave == 0) bitOn = false;
+        }
+        // 6. SHIELD: Cyber defense vertical scanning laser beam
+        else if (isShield && bitOn) {
+          if (r == shieldScanRow) {
+            display.fillRect(x, y, ledW, ledH, SSD1306_WHITE);
+            continue;
+          }
+        }
+        // 7. ALERT: Hazard strobe pulse
+        else if (isAlert) {
+          if (alertPhase && (r >= 2 && r <= 7) && (c == 6 || c == 7)) {
+            // Invert exclamation mark on strobe
+            bitOn = !bitOn;
+          }
+        }
+        // 8. SUN: Solar flare corona ray pulse
+        else if (isSun) {
+          if (sunFlare && (r == 0 || r == 11 || c == 0 || c == 13)) {
+            bitOn = !bitOn;
+          }
+        }
+        // 9. CLOUD: Animated rainfall droplets falling beneath cloud
+        else if (isCloud) {
+          if (r >= 8) {
+            bitOn = ((r + rainStep) % 3 == 0) && (c % 3 == 1);
+          }
+        }
+        // 10. CUP: Undulating hot steam trails rising from cup
+        else if (isCup && r <= 3) {
+          int steamCol1 = 4 + ((r + steamStep) % 3);
+          int steamCol2 = 8 + ((r + steamStep + 1) % 3);
+          bitOn = (c == steamCol1 || c == steamCol2);
+        }
+        // 11. BATTERY: Sequential charging flow filling battery cells
+        else if (isBattery && (r >= 3 && r <= 8) && (c >= 2 && c <= 11)) {
+          int fillCol = 2 + (chargeStep * 2);
+          if (c <= fillCol) bitOn = true;
+        }
+        // 12. ARCO: Rotating circular radar scanner highlight
+        else if (isArco && bitOn) {
+          int sector = (r * 2 + c) % 8;
+          if (sector == arcoSweep) {
+            display.fillRect(x, y, ledW, ledH, SSD1306_WHITE);
+            continue;
+          }
+        }
+        // 13. PC/MAC: Blinking terminal command cursor
+        else if (isPC) {
+          if (r == 4 && c == 7) bitOn = pcCursor;
+        }
+      }
+
+      if (bitOn) {
+        // Crisp Nothing OS rounded micro-LED dot
+        display.fillRoundRect(x, y, ledW, ledH, 1, SSD1306_WHITE);
+      } else {
+        // Subtle background matrix pinhole texture
+        if ((r % 2 == 0) && (c % 2 == 0)) {
+          display.drawPixel(x + (ledW / 2), y + (ledH / 2), SSD1306_WHITE);
+        }
+      }
+    }
+  }
+
+  // Floating background space particles for ROCKET in full screen mode
+  if (animate && isRocket && fullScreen) {
+    int starY1 = (now / 40) % 64;
+    int starY2 = (now / 30 + 32) % 64;
+    int starY3 = (now / 50 + 16) % 64;
+    display.drawPixel(10, starY1, SSD1306_WHITE);
+    display.drawPixel(118, starY2, SSD1306_WHITE);
+    display.drawPixel(20, starY3, SSD1306_WHITE);
+  }
+}
+
+// SCREEN 2: DriveSphere Guard & System Overview (Cyber Visor + Standby Badges)
 void renderIdleScreen() {
   display.clearDisplay();
   drawHeader();
 
-  // 1. Center Animated Cyber Visor / Face (X: 4 to 42, Y: 14 to 45)
-  display.drawRoundRect(4, 14, 38, 30, 4, SSD1306_WHITE);
-  // Visor eye pupils (blinks periodically every 3.5s)
-  bool blink = (millis() % 3500) < 180;
-  if (blink) {
-    display.drawFastHLine(11, 27, 7, SSD1306_WHITE);
-    display.drawFastHLine(25, 27, 7, SSD1306_WHITE);
-  } else {
-    display.fillCircle(14, 27, 3, SSD1306_WHITE);
-    display.fillCircle(28, 27, 3, SSD1306_WHITE);
-  }
-  // Subtle smile / breath accent
-  display.drawFastHLine(18, 36, 10, SSD1306_WHITE);
+  // 1. Center Animated Cyber Visor / Face (X: 4 to 44, Y: 14 to 46)
+  display.drawRoundRect(4, 14, 40, 32, 4, SSD1306_WHITE);
+  
+  // Dynamic eye expressions
+  unsigned long t = millis();
+  bool blink = (t % 3500) < 180;
+  int glance = (t / 3000) % 4; // 0: center, 1: left, 2: center, 3: right
+  int eyeOffset = (glance == 1) ? -2 : ((glance == 3) ? 2 : 0);
 
-  // 2. Right Side Standby Badges (X: 48 to 124)
+  if (isVehicleGuardArmed) {
+    // Red-alert scanning visor beam sweeps back and forth
+    int sweepX = 8 + ((t / 70) % 24);
+    display.drawFastHLine(7, 27, 26, SSD1306_WHITE);
+    display.fillRect(sweepX, 25, 6, 5, SSD1306_WHITE);
+  } else if (blink) {
+    // Closed blinking eyelids
+    display.drawFastHLine(11, 27, 8, SSD1306_WHITE);
+    display.drawFastHLine(27, 27, 8, SSD1306_WHITE);
+  } else {
+    // Expressive open eyes with pupils
+    display.drawCircle(15, 27, 4, SSD1306_WHITE);
+    display.drawCircle(31, 27, 4, SSD1306_WHITE);
+    display.fillCircle(15 + eyeOffset, 27, 2, SSD1306_WHITE);
+    display.fillCircle(31 + eyeOffset, 27, 2, SSD1306_WHITE);
+  }
+  // Subtle cyber mouth ventilation grille
+  display.drawFastHLine(18, 38, 12, SSD1306_WHITE);
+  display.drawPixel(21, 39, SSD1306_WHITE);
+  display.drawPixel(27, 39, SSD1306_WHITE);
+
+  // 2. Right Side Standby Badges (X: 48 to 126)
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(48, 14);
   display.print("DRIVESPHERE");
 
-  // Inverted standby pill (X: 48 to 118, W: 70)
-  display.fillRoundRect(48, 24, 70, 10, 2, SSD1306_WHITE);
+  // Inverted standby pill
+  display.fillRoundRect(48, 24, 74, 10, 2, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
-  display.setCursor(56, 25);
+  display.setCursor(52, 25);
   if (isVehicleGuardArmed) {
     display.print("GUARD: ON");
   } else {
-    display.print("STANDBY");
+    display.print("STANDBY: OK");
   }
   display.setTextColor(SSD1306_WHITE);
 
-  // Live Score & Status Line
+  // System status metrics
   display.setCursor(48, 37);
-  display.print("SCORE ");
-  display.print(currentScore);
-  display.print(" PTS");
+  display.print("IP:192.168.4.1");
 
-  // 3. Bottom Dual Cards (Y: 50 to 63, H: 13) - Single clean line per card
-  // Left Card: GPS Lock Status (60px wide)
-  display.drawRoundRect(1, 50, 60, 13, 2, SSD1306_WHITE);
+  // Bottom Footer Ribbon
+  display.drawFastHLine(0, 49, 128, SSD1306_WHITE);
   display.setCursor(4, 53);
-  if (currentGpsFix) {
-    display.print("3D FIX ");
-    display.print(currentGpsSats);
-    display.print("S");
-  } else if (totalGpsChars > 0) {
-    display.print("GPS: ACQ");
-  } else {
-    display.print("GPS: IDLE");
-  }
+  display.print("DOUBLE-TAP TO RIDE");
+  display.setCursor(114, 53);
+  display.print(currentScore);
 
-  // Right Card: Guard / Motion Readiness (60px wide)
-  display.drawRoundRect(67, 50, 60, 13, 2, SSD1306_WHITE);
-  display.setCursor(70, 53);
-  if (isVehicleGuardArmed) {
-    display.print(isTamperDetected ? "! ALERT !" : "GUARD: ON");
-  } else {
-    display.print("0KM/H PARK");
-  }
-
-  // Center vertical pagination
-  drawCardPagination(1);
+  drawPagination(2);
   display.display();
 }
 
-// SCREEN 2: Tactical Gyro Horizon & Live GPS Radar
+// SCREEN 3: Full-Screen Cyber Glyph Matrix (Edge-to-Edge Reactive Animations)
+void renderGlyphScreen() {
+  display.clearDisplay();
+
+  // Full-screen edge-to-edge glyph matrix (14 cols x 12 rows spanning 126x60 px)
+  const uint16_t* bitmap = getGlyphBitmap(currentGlyph);
+  drawGlyphMatrix(1, 2, bitmap, true, true);
+
+  // Discrete corner pagination dots
+  drawPagination(4);
+
+  display.display();
+}
+
+// SCREEN 3: Tactical Gyro Horizon & Live GPS Radar
 void renderTelemetryScreen() {
   display.clearDisplay();
   drawHeader();
 
-  // Left Half: Artificial Gyro Horizon (Center at X: 28, Y: 33, R: 18)
-  display.drawCircle(28, 33, 18, SSD1306_WHITE);
-  display.drawFastHLine(25, 33, 7, SSD1306_WHITE); // Center crosshair
-  display.drawFastVLine(28, 30, 7, SSD1306_WHITE);
+  // Left Half: Aircraft PFD Gyro Horizon (Center at X: 26, Y: 33, R: 18)
+  display.drawCircle(26, 33, 18, SSD1306_WHITE);
+  // Roll degree index ticks at top arc (0, ±30 deg)
+  display.drawFastVLine(26, 13, 2, SSD1306_WHITE); // 0 deg center index
+  display.drawPixel(13, 18, SSD1306_WHITE);        // -30 deg mark
+  display.drawPixel(39, 18, SSD1306_WHITE);        // +30 deg mark
 
-  // Tilted Artificial Horizon Line
+  // Center Aircraft Symbol: miniature wings and center dot
+  display.drawFastHLine(20, 33, 4, SSD1306_WHITE);
+  display.drawFastHLine(28, 33, 4, SSD1306_WHITE);
+  display.drawPixel(26, 33, SSD1306_WHITE);
+
+  // Tilted Artificial Horizon Line (Clamped to radius 16)
   float rad = currentLeanAngle * 3.14159265f / 180.0f;
   int dx = (int)(cos(rad) * 16.0f);
   int dy = (int)(sin(rad) * 16.0f);
-  display.drawLine(28 - dx, 33 - dy, 28 + dx, 33 + dy, SSD1306_WHITE);
+  display.drawLine(26 - dx, 33 - dy, 26 + dx, 33 + dy, SSD1306_WHITE);
 
   // Horizon Metrics Below Circle
   display.setCursor(2, 54);
   display.print(abs((int)currentLeanAngle));
   display.print((char)247);
-  display.print(currentLeanAngle < -2.0f ? "L" : (currentLeanAngle > 2.0f ? "R" : "-"));
-  display.setCursor(30, 54);
+  display.print(currentLeanAngle < -2.0f ? "L" : (currentLeanAngle > 2.0f ? "R" : "B"));
+  display.setCursor(28, 54);
   display.print(currentAccelG, 1);
   display.print("G");
 
-  // Vertical Divider
-  display.drawFastVLine(52, 12, 39, SSD1306_WHITE);
+  // Vertical Divider at X: 48
+  display.drawFastVLine(48, 11, 40, SSD1306_WHITE);
 
-  // Right Half: High-Density GPS Telemetry (Clean bounded text)
-  display.setCursor(56, 13);
+  // Right Half: Live GPS Telemetry & Satellite Constellation
+  display.setCursor(52, 13);
   display.print(currentGpsFix ? "3D GPS LOCK" : "SEARCHING");
 
-  display.setCursor(56, 23);
-  display.print("SATS:");
+  display.setCursor(52, 23);
+  display.print("SATS: ");
   display.print(currentGpsSats);
-  display.print(" ");
+  display.print(" | ");
   display.print((int)currentGpsAltM);
   display.print("M");
 
-  display.setCursor(56, 33);
-  display.print("LA:");
-  display.print(currentGpsLat, 3);
+  display.setCursor(52, 33);
+  display.print("LA: ");
+  display.print(currentGpsLat, 4);
 
-  display.setCursor(56, 43);
-  display.print("LO:");
-  display.print(currentGpsLng, 3);
+  display.setCursor(52, 42);
+  display.print("LO: ");
+  display.print(currentGpsLng, 4);
 
   // Bottom Status
   display.drawFastHLine(0, 51, 128, SSD1306_WHITE);
-  display.setCursor(56, 54);
-  display.print("HORIZON/GPS");
-  drawPagination(2);
-  display.display();
-}
-
-// SCREEN 3: Cyber Glyph Matrix & Bus Diagnostics
-void renderGlyphScreen() {
-  display.clearDisplay();
-  drawHeader();
-
-  // Left Half: Stylized Nothing-style Glyph Geometry
-  display.drawRoundRect(6, 13, 44, 36, 4, SSD1306_WHITE);
-  display.drawCircle(28, 24, 6, SSD1306_WHITE);       // Camera module halo
-  display.drawFastHLine(12, 34, 32, SSD1306_WHITE);    // Horizontal blade
-  display.drawFastVLine(28, 34, 12, SSD1306_WHITE);    // Vertical spine
-
-  // Dynamic light strobe animation
-  int strobe = (millis() / 180) % 4;
-  if (strobe == 0) display.fillCircle(12, 19, 2, SSD1306_WHITE);
-  if (strobe == 1) display.fillCircle(44, 19, 2, SSD1306_WHITE);
-  if (strobe == 2) display.fillCircle(28, 43, 2, SSD1306_WHITE);
-  if (strobe == 3) display.fillCircle(28, 24, 3, SSD1306_WHITE);
-
-  // Vertical Divider
-  display.drawFastVLine(54, 12, 39, SSD1306_WHITE);
-
-  // Right Half: System Hardware Diagnostics (Bounded 10-char lines)
-  display.setCursor(58, 13);
-  display.print("OLED: OK");
-
-  display.setCursor(58, 23);
-  display.print(mpuAvailable ? "MPU : OK" : "MPU : NO");
-
-  display.setCursor(58, 33);
-  display.print(totalGpsChars > 0 ? "GPS : OK" : "GPS : NO");
-
-  display.setCursor(58, 43);
-  display.print(SerialBT.hasClient() ? "BT  : LINK" : "BT  : RDY");
-
-  // Bottom Strip
-  display.drawFastHLine(0, 51, 128, SSD1306_WHITE);
-  display.setCursor(2, 54);
-  display.print("PIN:");
-  display.print(btDynamicPin);
-  display.setCursor(68, 54);
-  display.print("G:");
-  display.print(currentGlyph);
+  display.setCursor(52, 54);
+  display.print("PFD/GPS RADAR");
   drawPagination(3);
   display.display();
 }
+
+
 
 // ---------------------- Bluetooth Pairing Security Screen ----------------------
 void renderBtPairingScreen() {
@@ -809,23 +1406,21 @@ void updateOLED() {
     return;
   }
 
-  // Auto-idle behavior: If on Screen 0 (Aero HUD), vehicle is stopped, and stationary for > 4s
-  if (activeDisplayMode == 0 && currentSpeed == 0 && (millis() - lastMotionTime > 4000)) {
-    renderIdleScreen();
-    return;
-  }
-
+  // Render active OLED screen
   switch (activeDisplayMode) {
     case 0:
       renderMainHUD();
       break;
     case 1:
-      renderIdleScreen();
+      renderNavigationScreen();
       break;
     case 2:
-      renderTelemetryScreen();
+      renderIdleScreen();
       break;
     case 3:
+      renderTelemetryScreen();
+      break;
+    case 4:
       renderGlyphScreen();
       break;
     default:
@@ -837,6 +1432,13 @@ void updateOLED() {
 // ---------------------- JSON Telemetry Builder ----------------------
 String buildTelemetryJson() {
   String json = "{";
+  json += "\"device\":\"DriveSphere-AllInOne\",";
+  json += "\"hubIp\":\"192.168.4.1\",";
+  json += "\"camIp\":\"192.168.4.1\",";
+  json += "\"cameraReady\":" + String(cameraFound ? "true" : "false") + ",";
+  json += "\"cameraPid\":\"0x" + String(camSensorPid, HEX) + "\",";
+  json += "\"flashBrightness\":" + String(flashBrightness) + ",";
+  json += "\"stationsConnected\":" + String(WiFi.softAPgetStationNum()) + ",";
   json += "\"connected\":true,";
   json += "\"sosTriggered\":" + String(isSosTriggered ? "true" : "false") + ",";
   json += "\"tamperDetected\":" + String(isTamperDetected ? "true" : "false") + ",";
@@ -880,16 +1482,201 @@ void handleTelemetry() {
   server.send(200, "application/json", buildTelemetryJson());
 }
 
-void handleDisplay() {
-  if (server.hasArg("plain")) {
-    String body = server.arg("plain");
+// ---------------------- Native Camera Handlers ----------------------
+void handleCamCapture() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!cameraFound) {
+    server.send(503, "application/json", "{\"error\":\"Camera sensor offline\"}");
+    return;
+  }
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "application/json", "{\"error\":\"Frame capture timed out\"}");
+    return;
+  }
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
 
-    int line1Idx = body.indexOf("\"line1\":");
-    if (line1Idx != -1) {
-      int start = body.indexOf("\"", line1Idx + 8) + 1;
-      int end = body.indexOf("\"", start);
-      if (start > 0 && end > start) currentLine1 = body.substring(start, end);
+void handleCamStream() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!cameraFound) {
+    server.send(503, "text/plain", "Camera sensor offline");
+    return;
+  }
+
+  WiFiClient client = server.client();
+  String boundary = "123456789000000000000987654321";
+  String head = "HTTP/1.1 200 OK\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Content-Type: multipart/x-mixed-replace; boundary=" + boundary + "\r\n\r\n";
+  client.print(head);
+
+  unsigned long startTime = millis();
+  while (client.connected() && (millis() - startTime < 60000)) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) break;
+
+    client.print("--" + boundary + "\r\nContent-Type: image/jpeg\r\nContent-Length: " + String(fb->len) + "\r\n\r\n");
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
+    esp_camera_fb_return(fb);
+    delay(40); // ~25 FPS
+  }
+}
+
+void handleFlash() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.hasArg("brightness")) {
+    flashBrightness = constrain(server.arg("brightness").toInt(), 0, 255);
+  } else if (server.hasArg("state")) {
+    flashBrightness = (server.arg("state") == "1" || server.arg("state") == "true") ? 150 : 0;
+  } else {
+    flashBrightness = (flashBrightness > 0) ? 0 : 150;
+  }
+  setFlashBrightness(flashBrightness);
+  server.send(200, "application/json", "{\"flashBrightness\":" + String(flashBrightness) + "}");
+}
+
+void handleDisplay() {
+  String body = server.hasArg("plain") ? server.arg("plain") : "";
+  bool explicitScreen = false;
+
+  // 1. Parse screen parameter
+  if (server.hasArg("screen")) {
+    int scr = server.arg("screen").toInt();
+    if (scr >= 0 && scr <= 4) {
+      activeDisplayMode = scr;
+      explicitScreen = true;
+      lastMotionTime = millis();
     }
+  } else if (body.length() > 0) {
+    int screenIdx = body.indexOf("\"screen\":");
+    if (screenIdx != -1) {
+      int scr = body.substring(screenIdx + 9).toInt();
+      if (scr >= 0 && scr <= 4) {
+        activeDisplayMode = scr;
+        explicitScreen = true;
+        lastMotionTime = millis();
+      }
+    }
+  }
+
+  // 2. Parse navActive parameter
+  if (server.hasArg("navActive")) {
+    String val = server.arg("navActive");
+    val.toLowerCase();
+    isNavActive = (val == "true" || val == "1");
+    if (isNavActive) {
+      activeDisplayMode = 1;
+      explicitScreen = true;
+      lastMotionTime = millis();
+    }
+  } else if (body.length() > 0) {
+    int navActiveIdx = body.indexOf("\"navActive\":");
+    if (navActiveIdx != -1) {
+      String sub = body.substring(navActiveIdx + 11, min((int)body.length(), navActiveIdx + 25));
+      sub.toLowerCase();
+      if (sub.indexOf("true") != -1 || sub.indexOf("1") != -1) {
+        isNavActive = true;
+        activeDisplayMode = 1;
+        explicitScreen = true;
+        lastMotionTime = millis();
+      } else if (sub.indexOf("false") != -1 || sub.indexOf("0") != -1) {
+        isNavActive = false;
+      }
+    }
+  }
+
+  // 3. Parse navManeuver
+  if (server.hasArg("navManeuver")) {
+    navManeuver = server.arg("navManeuver");
+    navManeuver.trim();
+  } else if (body.length() > 0) {
+    int manIdx = body.indexOf("\"navManeuver\":");
+    if (manIdx != -1) {
+      int start = body.indexOf("\"", manIdx + 14) + 1;
+      int end = body.indexOf("\"", start);
+      if (start > 0 && end > start) {
+        navManeuver = body.substring(start, end);
+        navManeuver.trim();
+      }
+    }
+  }
+
+  // 4. Parse navDistance
+  if (server.hasArg("navDistance")) {
+    navDistance = server.arg("navDistance");
+    navDistance.trim();
+  } else if (body.length() > 0) {
+    int distIdx = body.indexOf("\"navDistance\":");
+    if (distIdx != -1) {
+      int start = body.indexOf("\"", distIdx + 14) + 1;
+      int end = body.indexOf("\"", start);
+      if (start > 0 && end > start) {
+        navDistance = body.substring(start, end);
+        navDistance.trim();
+      }
+    }
+  }
+
+  // 5. Parse navEta
+  if (server.hasArg("navEta")) {
+    navEta = server.arg("navEta");
+    navEta.trim();
+  } else if (body.length() > 0) {
+    int etaIdx = body.indexOf("\"navEta\":");
+    if (etaIdx != -1) {
+      int start = body.indexOf("\"", etaIdx + 9) + 1;
+      int end = body.indexOf("\"", start);
+      if (start > 0 && end > start) {
+        navEta = body.substring(start, end);
+        navEta.trim();
+      }
+    }
+  }
+
+  // 6. Parse navStreet
+  if (server.hasArg("navStreet")) {
+    navStreet = server.arg("navStreet");
+    navStreet.trim();
+  } else if (body.length() > 0) {
+    int streetIdx = body.indexOf("\"navStreet\":");
+    if (streetIdx != -1) {
+      int start = body.indexOf("\"", streetIdx + 12) + 1;
+      int end = body.indexOf("\"", start);
+      if (start > 0 && end > start) {
+        navStreet = body.substring(start, end);
+        navStreet.trim();
+      }
+    }
+  }
+
+  // 7. Parse Glyph
+  if (server.hasArg("glyph")) {
+    currentGlyph = server.arg("glyph");
+    currentGlyph.trim();
+    if (!explicitScreen) activeDisplayMode = 4;
+    lastMotionTime = millis();
+  } else if (body.length() > 0) {
+    int glyphIdx = body.indexOf("\"glyph\":");
+    if (glyphIdx != -1) {
+      int start = body.indexOf("\"", glyphIdx + 8) + 1;
+      int end = body.indexOf("\"", start);
+      if (start > 0 && end > start) {
+        currentGlyph = body.substring(start, end);
+        currentGlyph.trim();
+        if (!explicitScreen) activeDisplayMode = 4;
+        lastMotionTime = millis();
+      }
+    }
+  }
+
+  // 8. Parse Speed & Score & Guard
+  if (body.length() > 0) {
     int speedIdx = body.indexOf("\"speed\":");
     if (speedIdx != -1) {
       int spd = body.substring(speedIdx + 8).toInt();
@@ -900,26 +1687,18 @@ void handleDisplay() {
     if (scoreIdx != -1) {
       currentScore = body.substring(scoreIdx + 8).toInt();
     }
-    int modeIdx = body.indexOf("\"vehicleMode\":");
-    if (modeIdx != -1) {
-      int start = body.indexOf("\"", modeIdx + 14) + 1;
-      int end = body.indexOf("\"", start);
-      if (start > 0 && end > start) vehicleMode = body.substring(start, end);
-    }
-    int glyphIdx = body.indexOf("\"glyph\":");
-    if (glyphIdx != -1) {
-      int start = body.indexOf("\"", glyphIdx + 8) + 1;
-      int end = body.indexOf("\"", start);
-      if (start > 0 && end > start) currentGlyph = body.substring(start, end);
-    }
     int guardIdx = body.indexOf("\"guardArmed\":");
     if (guardIdx != -1) {
       isVehicleGuardArmed = body.substring(guardIdx + 13).startsWith("true");
     }
-    updateOLED();
   }
+
+  Serial.printf("[Display Engine] Screen=%d | NavActive=%d | Maneuver=%s | Dist=%s | Street=%s\n",
+                activeDisplayMode, isNavActive ? 1 : 0, navManeuver.c_str(), navDistance.c_str(), navStreet.c_str());
+
+  updateOLED();
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", "{\"status\":\"success\"}");
+  server.send(200, "application/json", "{\"status\":\"success\",\"screen\":" + String(activeDisplayMode) + "}");
 }
 
 void handleSOS() {
@@ -934,61 +1713,156 @@ void handleResetSOS() {
   server.send(200, "application/json", "{\"status\":\"reset_ok\"}");
 }
 
+void handleRoot() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>DriveSphere Guardian Hub</title>"
+    "<style>"
+    "body{background:#0d0f12;color:#fff;font-family:system-ui,-apple-system,sans-serif;margin:0;padding:20px;text-align:center;}"
+    ".card{background:#1a1d24;border:1px solid #2d3340;border-radius:12px;max-width:440px;margin:20px auto;padding:24px;box-shadow:0 8px 24px rgba(0,0,0,0.5);}"
+    "h1{color:#00e5ff;font-size:22px;letter-spacing:2px;margin-top:0;}"
+    ".stat{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #232834;font-size:15px;}"
+    ".val{font-weight:bold;color:#a0aec0;}"
+    ".val.active{color:#00e676;}"
+    ".val.sos{color:#ff1744;}"
+    "a.btn{display:inline-block;background:#00e5ff;color:#000;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;margin:8px 4px;}"
+    "</style></head><body>"
+    "<div class='card'>"
+    "<h1>DRIVESPHERE HUB</h1>"
+    "<div class='stat'><span>Hardware Mode</span><span class='val active'>ESP32 Guardian</span></div>"
+    "<div class='stat'><span>Active Screen</span><span class='val'>" + String(activeDisplayMode) + "</span></div>"
+    "<div class='stat'><span>GPS Fix</span><span class='val " + String(currentGpsFix ? "active" : "") + "'>" + (currentGpsFix ? ("3D LOCK (" + String(currentGpsSats) + " Sats)") : "SEARCHING...") + "</span></div>"
+    "<div class='stat'><span>Standby Glyph</span><span class='val active'>" + currentGlyph + "</span></div>"
+    "<div class='stat'><span>Speed</span><span class='val'>" + String(currentSpeed) + " km/h</span></div>"
+    "<div class='stat'><span>Emergency SOS</span><span class='val " + String(isSosTriggered ? "sos" : "active") + "'>" + (isSosTriggered ? "TRIGGERED!" : "NORMAL") + "</span></div>"
+    "<br>"
+    "<div style='font-size:13px;color:#a0aec0;margin-bottom:8px;'>TEST OLED GLYPH PATTERNS</div>"
+    "<a class='btn' style='font-size:12px;padding:6px 10px;' href='/set_glyph?name=IDLE_FACE'>IDLE</a>"
+    "<a class='btn' style='font-size:12px;padding:6px 10px;' href='/set_glyph?name=SHIELD'>SHIELD</a>"
+    "<a class='btn' style='font-size:12px;padding:6px 10px;' href='/set_glyph?name=ROCKET'>ROCKET</a>"
+    "<a class='btn' style='font-size:12px;padding:6px 10px;' href='/set_glyph?name=ALERT'>ALERT</a>"
+    "<a class='btn' style='font-size:12px;padding:6px 10px;' href='/set_glyph?name=TURN_LEFT'>LEFT</a>"
+    "<a class='btn' style='font-size:12px;padding:6px 10px;' href='/set_glyph?name=TURN_RIGHT'>RIGHT</a>"
+    "<br><br>"
+    "<a class='btn' href='/status'>JSON Status</a>"
+    "<a class='btn' href='/telemetry'>Live Telemetry</a>"
+    "</div><script>setTimeout(function(){location.reload();},2500);</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSetGlyph() {
+  if (server.hasArg("name")) {
+    currentGlyph = server.arg("name");
+    currentGlyph.trim();
+    Serial.printf("[Glyph Engine] Set glyph to: %s\n", currentGlyph.c_str());
+    updateOLED();
+  }
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "Redirecting...");
+}
+
 void handleNotFound() {
-  server.send(404, "text/plain", "DriveSphere Hub - Not Found");
+  if (server.uri() == "/generate_204") {
+    server.send(204, "text/plain", "");
+  } else {
+    server.send(404, "text/plain", "DriveSphere Hub - Not Found");
+  }
 }
 
 // ---------------------- Push Button Handler ----------------------
 void checkButton() {
-  int reading = digitalRead(BUTTON_PIN);
+  int rawReading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
 
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
+  // 1. Debounce state machine
+  static int debouncedState = HIGH;
+  static int prevRaw = HIGH;
+  static unsigned long stateChangeTime = 0;
+  static unsigned long pendingTapReleaseTime = 0;
+  static int tapCount = 0;
+
+  if (rawReading != prevRaw) {
+    prevRaw = rawReading;
+    stateChangeTime = now;
   }
 
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading == LOW && !isButtonPressed) {
-      isButtonPressed = true;
-      buttonPressStartTime = millis();
-      longPressTriggered = false;
-    } 
-    else if (reading == LOW && isButtonPressed) {
-      if (!longPressTriggered && (millis() - buttonPressStartTime >= LONG_PRESS_MS)) {
-        longPressTriggered = true;
-        if (isSosTriggered) {
-          clearSos();
-        } else {
-          isSosTriggered = true;
-          isCrashDetected = false;
-          peakCrashG = 0.0f;
-          peakTiltDeg = 0.0f;
-          updateOLED();
+  // Require raw reading to remain rock-solid stable for 60ms
+  if ((now - stateChangeTime) >= 60) {
+    if (rawReading != debouncedState) {
+      debouncedState = rawReading;
+
+      if (debouncedState == LOW) {
+        // Genuine button pressed down
+        isButtonPressed = true;
+        buttonPressStartTime = now;
+        longPressTriggered = false;
+      } else {
+        // Genuine button released up
+        if (isButtonPressed) {
+          isButtonPressed = false;
+          unsigned long pressDuration = now - buttonPressStartTime;
+
+          // Check if it was during Bluetooth authorization
+          if (isBtPairingActive && btPairingPendingConfirm) {
+            btPairingPendingConfirm = false;
+            isBtPairingActive = false;
+            btPairingSuccess = true;
+            btAuthCompleteTime = now;
+#if ENABLE_BLUETOOTH
+            SerialBT.confirmReply(true);
+#endif
+            Serial.println(F("[Bluetooth Security] Button Pressed -> Pairing Approved!"));
+            updateOLED();
+          } else if (!longPressTriggered && pressDuration >= 60) {
+            tapCount++;
+            pendingTapReleaseTime = now;
+          }
         }
-        SerialBT.println("{\"sosTriggered\":" + String(isSosTriggered ? "true" : "false") + "}");
-      }
-    } 
-    else if (reading == HIGH && isButtonPressed) {
-      isButtonPressed = false;
-      if (isBtPairingActive && btPairingPendingConfirm) {
-        // Rider physically pressed button on vehicle to AUTHORIZE pairing!
-        btPairingPendingConfirm = false;
-        isBtPairingActive = false;
-        btPairingSuccess = true;
-        btAuthCompleteTime = millis();
-        SerialBT.confirmReply(true); // Approve pairing
-        Serial.println(F("[Bluetooth Security] Physical button PRESSED -> Pairing APPROVED by Rider!"));
-        updateOLED();
-      } else if (!longPressTriggered) {
-        activeDisplayMode = (activeDisplayMode + 1) % 4;
-        updateOLED();
       }
     }
   }
 
-  lastButtonState = reading;
+  // 2. Multi-Tap Arbiter (fires after 300ms window)
+  if (tapCount > 0 && !isButtonPressed && (now - pendingTapReleaseTime > 300)) {
+    if (tapCount == 1) {
+      // Single Tap: Cycle through all 5 screens (0, 1, 2, 3, 4)
+      activeDisplayMode = (activeDisplayMode + 1) % 5;
+      Serial.printf("[Button] Single Tap -> Switched to Screen %d\n", activeDisplayMode);
+      lastMotionTime = now;
+      updateOLED();
+    } else if (tapCount >= 2) {
+      // Double Tap: Direct shortcut to Idle Screen (Screen 2) or Cockpit HUD (Screen 0)
+      activeDisplayMode = (activeDisplayMode == 2) ? 0 : 2;
+      Serial.printf("[Button] Double Tap -> Switched to Screen %d\n", activeDisplayMode);
+      lastMotionTime = now;
+      updateOLED();
+    }
+    tapCount = 0;
+    pendingTapReleaseTime = 0;
+  }
+
+  // 3. Long Press check (held LOW for >= 3000ms)
+  if (isButtonPressed && !longPressTriggered && (now - buttonPressStartTime >= LONG_PRESS_MS)) {
+    longPressTriggered = true;
+    tapCount = 0; // Clear pending taps
+    if (isSosTriggered) {
+      clearSos();
+    } else {
+      isSosTriggered = true;
+      isCrashDetected = false;
+      peakCrashG = 0.0f;
+      peakTiltDeg = 0.0f;
+      updateOLED();
+    }
+#if ENABLE_BLUETOOTH
+    SerialBT.println("{\"sosTriggered\":" + String(isSosTriggered ? "true" : "false") + "}");
+#endif
+    Serial.println(F("[Button] 3-Second Long Press -> SOS Toggled!"));
+  }
 }
 
 // ---------------------- Bluetooth Callbacks & Handler ----------------------
+#if ENABLE_BLUETOOTH
 void BTConfirmRequestCallback(uint32_t numVal) {
   btPairingCode = numVal;
   isBtPairingActive = true;
@@ -1036,41 +1910,170 @@ void handleBluetooth() {
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
     Serial.println(F("[Bluetooth Security] Phone disconnected. Hub discoverable for owner reconnect."));
   }
+
+  // Process Bluetooth Serial input
   if (SerialBT.available()) {
     String line = SerialBT.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0) {
-      if (line.startsWith("SPEED:")) {
-        int spd = line.substring(6).toInt();
-        if (!currentGpsFix || spd > 0) currentSpeed = spd;
-        if (currentSpeed > 0) lastMotionTime = millis();
-        updateOLED();
-      } else if (line.startsWith("SCORE:")) {
-        currentScore = line.substring(6).toInt();
-        updateOLED();
-      } else if (line.startsWith("MODE:")) {
-        vehicleMode = line.substring(5);
-        updateOLED();
-      } else if (line.startsWith("GLYPH:")) {
-        currentGlyph = line.substring(6);
-        updateOLED();
-      } else if (line.startsWith("GUARD:")) {
-        isVehicleGuardArmed = (line.substring(6) == "ARMED");
-        if (!isVehicleGuardArmed) isTamperDetected = false;
-        updateOLED();
-      } else if (line == "RESET_SOS") {
-        clearSos();
-        SerialBT.println("{\"status\":\"reset_ok\"}");
-      } else if (line == "STATUS" || line == "TELEMETRY") {
-        SerialBT.println(buildTelemetryJson());
-      }
-    }
+    processCommand(line, true);
   }
 
   // Periodic BT telemetry broadcast every 1.5s
   if (millis() - lastBtBroadcastTime > 1500) {
     lastBtBroadcastTime = millis();
     SerialBT.println(buildTelemetryJson());
+  }
+}
+#endif
+
+void sendReply(const String& str, bool isBT) {
+#if ENABLE_BLUETOOTH
+  if (isBT) SerialBT.print(str);
+  else Serial.print(str);
+#else
+  Serial.print(str);
+#endif
+}
+
+void sendReplyLine(const String& str, bool isBT) {
+#if ENABLE_BLUETOOTH
+  if (isBT) SerialBT.println(str);
+  else Serial.println(str);
+#else
+  Serial.println(str);
+#endif
+}
+
+void processCommand(String line, bool isBT) {
+  line.trim();
+  if (line.length() == 0) return;
+
+  if (line.startsWith("SPEED:")) {
+    int spd = line.substring(6).toInt();
+    if (!currentGpsFix || spd > 0) currentSpeed = spd;
+    if (currentSpeed > 0) lastMotionTime = millis();
+    updateOLED();
+    if (!isBT) Serial.printf("[Serial] Speed set to %d km/h\n", currentSpeed);
+  } else if (line.startsWith("SCORE:")) {
+    currentScore = line.substring(6).toInt();
+    updateOLED();
+    if (!isBT) Serial.printf("[Serial] Score set to %d\n", currentScore);
+  } else if (line.startsWith("MODE:")) {
+    vehicleMode = line.substring(5);
+    vehicleMode.trim();
+    updateOLED();
+    if (!isBT) Serial.printf("[Serial] Mode set to %s\n", vehicleMode.c_str());
+  } else if (line.startsWith("GLYPH:")) {
+    currentGlyph = line.substring(6);
+    currentGlyph.trim();
+    activeDisplayMode = 4; // Switch to Screen 4: Full-Screen Cyber Glyph Matrix!
+    lastMotionTime = millis();
+    updateOLED();
+    if (!isBT) Serial.printf("[Serial] Glyph set to %s -> Screen 4\n", currentGlyph.c_str());
+  } else if (line.startsWith("NAV:")) {
+    String navPayload = line.substring(4);
+    navPayload.trim();
+    if (navPayload == "STOP") {
+      isNavActive = false;
+      activeDisplayMode = 0;
+    } else {
+      isNavActive = true;
+      activeDisplayMode = 1; // Navigation Screen!
+      int c1 = navPayload.indexOf(',');
+      int c2 = navPayload.indexOf(',', c1 + 1);
+      int c3 = navPayload.indexOf(',', c2 + 1);
+      if (c1 != -1) navManeuver = navPayload.substring(0, c1);
+      if (c2 != -1) navDistance = navPayload.substring(c1 + 1, c2);
+      if (c3 != -1) {
+        navEta = navPayload.substring(c2 + 1, c3);
+        navStreet = navPayload.substring(c3 + 1);
+      } else if (c2 != -1) {
+        navStreet = navPayload.substring(c2 + 1);
+      }
+    }
+    lastMotionTime = millis();
+    updateOLED();
+    if (!isBT) Serial.printf("[Serial] Navigation: Screen 1, %s, %s, %s, %s\n", navManeuver.c_str(), navDistance.c_str(), navEta.c_str(), navStreet.c_str());
+  } else if (line.startsWith("SCREEN:")) {
+    int scr = line.substring(7).toInt();
+    if (scr >= 0 && scr <= 4) activeDisplayMode = scr;
+    lastMotionTime = millis();
+    updateOLED();
+    if (!isBT) Serial.printf("[Serial] Active Screen switched to %d\n", activeDisplayMode);
+  } else if (line.startsWith("GUARD:")) {
+    isVehicleGuardArmed = (line.substring(6) == "ARMED");
+    if (!isVehicleGuardArmed) isTamperDetected = false;
+    updateOLED();
+  } else if (line == "RESET_SOS") {
+    clearSos();
+    sendReplyLine("{\"status\":\"reset_ok\"}", isBT);
+  } else if (line == "STATUS" || line == "TELEMETRY") {
+    String json = buildTelemetryJson();
+    sendReplyLine(json, isBT);
+  } else if (line == "CAM" || line == "CHECK_CAM") {
+    if (cameraFound) {
+      camera_fb_t * fb = esp_camera_fb_get();
+      if (fb) {
+        Serial.printf("[HARDWARE SENSOR CONFIRMED] Sensor PID: 0x%02X | Frame: %u bytes JPEG captured!\n", camSensorPid, fb->len);
+        char cbuf[96];
+        snprintf(cbuf, sizeof(cbuf), "{\"camera\":\"OK\",\"pid\":\"0x%02X\",\"bytes\":%u}\n", camSensorPid, fb->len);
+        sendReply(String(cbuf), isBT);
+        esp_camera_fb_return(fb);
+      } else {
+        Serial.println(F("[HARDWARE SENSOR ERROR] Sensor initialized but frame capture timed out."));
+      }
+    } else {
+      Serial.println(F("[HARDWARE SENSOR NOTICE] Camera sensor offline. Retrying init..."));
+      if (initCamera()) {
+        Serial.println(F("[HARDWARE SENSOR CONFIRMED] Camera successfully initialized on retry!"));
+      } else {
+        Serial.println(F("[HARDWARE SENSOR RESULT] No camera sensor response. Check ribbon cable."));
+      }
+    }
+  } else if (line == "SCAN") {
+    String out = "[I2C SCAN START]\n";
+    struct PinPair { int sda; int scl; const char* name; };
+    PinPair pairs[] = {
+      { 15, 14, "SDA=15, SCL=14" },
+      { 13, 2,  "SDA=13, SCL=2" },
+      { 14, 15, "SDA=14, SCL=15" },
+      { 2,  13, "SDA=2, SCL=13" }
+    };
+    for (auto& p : pairs) {
+      Wire.end();
+      pinMode(p.sda, INPUT_PULLUP);
+      pinMode(p.scl, INPUT_PULLUP);
+      Wire.setPins(p.sda, p.scl);
+      Wire.begin(p.sda, p.scl);
+      Wire.setClock(100000);
+      Wire.setTimeOut(25);
+      out += "Pins (" + String(p.name) + "): ";
+      int foundCount = 0;
+      for (byte addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+          char hexBuf[10];
+          snprintf(hexBuf, sizeof(hexBuf), "0x%02X ", addr);
+          out += hexBuf;
+          foundCount++;
+        }
+      }
+      if (foundCount == 0) out += "NONE";
+      out += "\n";
+    }
+    // Restore chosen pins
+    Wire.end();
+    Wire.begin(chosenSda, chosenScl);
+    out += "[I2C SCAN COMPLETE]\n";
+    sendReply(out, isBT);
+  } else if (line == "INIT_OLED") {
+    bool ok = initOledDisplay();
+    String resp = ok ? "{\"oledInit\":true,\"sda\":" + String(chosenSda) + ",\"scl\":" + String(chosenScl) + ",\"addr\":\"0x" + String(activeOledAddr, HEX) + "\"}\n"
+                     : "{\"oledInit\":false}\n";
+    sendReply(resp, isBT);
+  } else if (line == "REBOOT" || line == "RESTART") {
+    Serial.println("[System] Rebooting ESP32...");
+    delay(100);
+    ESP.restart();
   }
 }
 
@@ -1120,115 +2123,167 @@ void showLoadingSplash(int progress, const char* label) {
   display.display();
 }
 
-// ---------------------- Setup & Main Loop ----------------------
-void setup() {
-  Serial.begin(115200);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+bool initOledDisplay() {
+  struct I2CPinCandidate { int sda; int scl; const char* desc; };
+  I2CPinCandidate pinCandidates[] = {
+    { 15, 14, "Configured Pins (SDA=15, SCL=14)" },
+    { 13, 2,  "Alternate Header Pins (SDA=13, SCL=2)" },
+    { 14, 15, "Reversed Wiring (SDA=14, SCL=15)" },
+    { 2,  13, "Reversed Alternate Pins (SDA=2, SCL=13)" }
+  };
 
-  // Initialize Hardware UART2 for NEO-M8N GPS
-  SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.println(F("[DriveSphere] NEO-M8N GPS UART2 started on RX=16, TX=17 @ 9600 baud"));
-
-  // Initialize I2C Bus on GPIO 15 (SDA) and GPIO 14 (SCL)
-  Serial.println(F("[DriveSphere] Initializing OLED I2C Bus 0 (SDA=15, SCL=14)..."));
-  Wire.setPins(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(100000); // 100 kHz for reliable jumper wire signals
-
-  // Scan and detect OLED address (0x3C or 0x3D)
   byte oledAddr = 0;
-  for (byte addr = 0x3C; addr <= 0x3D; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      oledAddr = addr;
-      break;
-    }
-  }
+  oledFound = false;
 
-  // If not found, auto-test reversed pin configuration (SDA=14, SCL=15)
-  if (oledAddr == 0) {
+  for (const auto& candidate : pinCandidates) {
     Wire.end();
-    Wire.setPins(I2C_SCL_PIN, I2C_SDA_PIN);
-    Wire.begin(I2C_SCL_PIN, I2C_SDA_PIN);
+    pinMode(candidate.sda, INPUT_PULLUP);
+    pinMode(candidate.scl, INPUT_PULLUP);
+    Wire.setPins(candidate.sda, candidate.scl);
+    Wire.begin(candidate.sda, candidate.scl);
     Wire.setClock(100000);
+    Wire.setTimeOut(25); // Essential 25ms timeout prevents hanging if pins are floating!
+
     for (byte addr = 0x3C; addr <= 0x3D; addr++) {
       Wire.beginTransmission(addr);
       if (Wire.endTransmission() == 0) {
         oledAddr = addr;
-        Serial.println(F("[DriveSphere] Auto-detected OLED with reversed wiring (SDA=14, SCL=15)!"));
+        chosenSda = candidate.sda;
+        chosenScl = candidate.scl;
+        activeOledAddr = addr;
+        Serial.printf("[DriveSphere] Auto-Detected OLED at 0x%02X on %s!\n", addr, candidate.desc);
         break;
       }
     }
-    if (oledAddr == 0) {
-      // Revert to configured pins (15, 14)
-      Wire.end();
-      Wire.setPins(I2C_SDA_PIN, I2C_SCL_PIN);
-      Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-      Wire.setClock(100000);
-      Serial.println(F("[DriveSphere] WARNING: No OLED found on I2C bus! Verify VCC (3.3V/5V), GND, SDA=15, SCL=14"));
-    }
+    if (oledAddr != 0) break;
   }
 
-  // Initialize OLED Display (reset=false, periphBegin=false to preserve Wire pins)
-  bool oledFound = false;
-  byte targetAddr = (oledAddr != 0) ? oledAddr : 0x3C;
-  if (display.begin(SSD1306_SWITCHCAPVCC, targetAddr, false, false)) {
+  if (oledAddr == 0) {
+    Serial.println(F("[DriveSphere] Notice: Auto-scan did not find OLED ACK. Initializing default SDA=15, SCL=14."));
+    Wire.end();
+    pinMode(15, INPUT_PULLUP);
+    pinMode(14, INPUT_PULLUP);
+    Wire.setPins(15, 14);
+    Wire.begin(15, 14);
+    Wire.setClock(100000);
+    oledAddr = 0x3C;
+    chosenSda = 15;
+    chosenScl = 14;
+    activeOledAddr = 0x3C;
+  }
+
+  if (display.begin(SSD1306_SWITCHCAPVCC, oledAddr, false, false)) {
     oledFound = true;
-    Serial.print(F("[DriveSphere] OLED SSD1306 Initialized at 0x"));
-    Serial.println(targetAddr, HEX);
     display.ssd1306_command(SSD1306_SETCONTRAST);
     display.ssd1306_command(0xFF); // Maximum display brightness
+    display.clearDisplay();
+    display.display();
+    Serial.printf("[DriveSphere] OLED SSD1306 Initialized at 0x%02X!\n", oledAddr);
+    return true;
   } else {
-    // Retry with 0x3D if 0x3C failed
-    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D, false, false)) {
+    byte altAddr = (oledAddr == 0x3C) ? 0x3D : 0x3C;
+    if (display.begin(SSD1306_SWITCHCAPVCC, altAddr, false, false)) {
       oledFound = true;
-      Serial.println(F("[DriveSphere] OLED SSD1306 Initialized at 0x3D"));
+      activeOledAddr = altAddr;
       display.ssd1306_command(SSD1306_SETCONTRAST);
       display.ssd1306_command(0xFF);
+      display.clearDisplay();
+      display.display();
+      Serial.printf("[DriveSphere] OLED SSD1306 Initialized at alternate 0x%02X!\n", altAddr);
+      return true;
     }
   }
+  return false;
+}
 
+// ---------------------- Setup & Main Loop ----------------------
+void setup() {
+  // 1. Disable brownout detector during high-draw camera + Wi-Fi bursts
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // 2. Initialize Flashlight LED with PWM
+  ledcAttach(FLASH_LED_PIN, FLASH_PWM_FREQ, FLASH_PWM_RES);
+  setFlashBrightness(0);
+
+  // 3. Probe & Initialize OV2640 Image Sensor FIRST (Deconflicted I2C)
+  initCamera();
+
+  // 4. Initialize Hardware UART2 for NEO-M8N GPS (PSRAM-Safe Pinout)
+#if GPS_RX_PIN >= 0
+  SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.printf("[DriveSphere] NEO-M8N GPS UART2 started on RX=%d @ %d baud (PSRAM Protected)\n", GPS_RX_PIN, GPS_BAUD);
+#else
+  Serial.println(F("[DriveSphere] GPS UART2 disabled to preserve PSRAM"));
+#endif
+
+  // 5. Initialize OLED Display (I2C Bus 0)
+  initOledDisplay();
   if (oledFound) {
-    showLoadingSplash(25, "BOOTING SYSTEM");
+    showLoadingSplash(35, cameraFound ? "CAMERA + OLED OK" : "BOOTING SYSTEM");
   }
 
-  // Initialize MPU-6050 IMU on dedicated I2C bus
+  // 6. Initialize MPU-6050 IMU on shared Wire bus
   initMPU6050();
-  if (oledFound) showLoadingSplash(50, "CALIBRATING IMU");
+  if (oledFound) showLoadingSplash(60, "CALIBRATING IMU");
 
-  // Start Wi-Fi Access Point
-  WiFi.softAP(apSSID, apPassword);
+  // 7. Start Wi-Fi in High-Performance SoftAP Mode (Fixed Channel 1, No Sleep)
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  IPAddress local_ip(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  WiFi.softAP(apSSID, apPassword, 1, 0, 4);
   IPAddress IP = WiFi.softAPIP();
-  Serial.print(F("[DriveSphere] Wi-Fi SoftAP Started: "));
+  Serial.print(F("[DriveSphere] Wi-Fi SoftAP Started on: "));
   Serial.println(IP);
+
+  Serial.printf("[DriveSphere Memory] Free DRAM: %u bytes | Free PSRAM: %u bytes\n", ESP.getFreeHeap(), ESP.getFreePsram());
   if (oledFound) showLoadingSplash(75, "STARTING COMMS");
 
-  // Generate random dynamic 6-digit rolling PIN (no static "1234")
+  // Generate random dynamic 6-digit rolling PIN
   uint32_t randCode = esp_random() % 900000 + 100000;
   snprintf(btDynamicPin, sizeof(btDynamicPin), "%06u", randCode);
 
-  // Start Bluetooth Classic SPP with 2-Factor Physical Button Authorization
+#if ENABLE_BLUETOOTH
+  // Start Bluetooth Classic SPP
   SerialBT.enableSSP();
   SerialBT.onConfirmRequest(BTConfirmRequestCallback);
   SerialBT.onAuthComplete(BTAuthCompleteCallback);
   SerialBT.begin("DriveSphere-Hub");
   SerialBT.setPin(btDynamicPin, 6);
   Serial.printf("[DriveSphere Security] Bluetooth Active as 'DriveSphere-Hub' (PIN: %s | Physical Button Auth: ENABLED)\n", btDynamicPin);
+#else
+  Serial.println(F("[DriveSphere Comms] High-Speed Wi-Fi SoftAP Mode Active (192.168.4.1)"));
+#endif
   if (oledFound) {
     showLoadingSplash(100, "SYSTEM READY");
     delay(400);
   }
 
   // Register Web Server Endpoints
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/generate_204", HTTP_GET, handleStatus);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/telemetry", HTTP_GET, handleTelemetry);
   server.on("/display", HTTP_POST, handleDisplay);
+  server.on("/display", HTTP_GET, handleDisplay);
+  server.on("/navigation", HTTP_POST, handleDisplay);
+  server.on("/navigation", HTTP_GET, handleDisplay);
+  server.on("/set_glyph", HTTP_GET, handleSetGlyph);
   server.on("/sos", HTTP_GET, handleSOS);
   server.on("/reset_sos", HTTP_POST, handleResetSOS);
+  server.on("/capture", HTTP_GET, handleCamCapture);
+  server.on("/stream", HTTP_GET, handleCamStream);
+  server.on("/flash", HTTP_GET, handleFlash);
+  server.on("/flash", HTTP_POST, handleFlash);
   server.onNotFound(handleNotFound);
 
   server.begin();
-  Serial.println(F("[DriveSphere] HTTP Server listening on port 80"));
+  Serial.println(F("[DriveSphere] All-In-One HTTP Server listening on port 80"));
 
   updateOLED();
 }
@@ -1238,12 +2293,18 @@ void loop() {
   checkButton();
   readGPS();
   readMPU6050();
+#if ENABLE_BLUETOOTH
   handleBluetooth();
-
   if (btPairingNeedsUpdate) {
     btPairingNeedsUpdate = false;
     updateOLED();
   }
+#else
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    processCommand(line, false);
+  }
+#endif
 
   // Refresh OLED periodically (every 150ms)
   if (millis() - lastDisplayRefreshTime > 150) {

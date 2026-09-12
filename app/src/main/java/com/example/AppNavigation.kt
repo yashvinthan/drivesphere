@@ -198,7 +198,13 @@ fun DriveSphereApp() {
                                 }
                             },
                             onAOD = { navController.navigate("aod") },
-                            onOpenDashcam = { navController.navigate("dashcam") }
+                            onOpenDashcam = { navController.navigate("dashcam") },
+                            onUpdateNavigation = { maneuver, dist, eta, street ->
+                                viewModel.updateNavigation(maneuver, dist, eta, street)
+                            },
+                            onEndNavigation = {
+                                viewModel.endNavigation()
+                            }
                         )
                     }
                     composable("echallan") {

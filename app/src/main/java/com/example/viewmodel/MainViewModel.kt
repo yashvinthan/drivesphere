@@ -68,11 +68,14 @@ data class AppState(
     val driveCoins: Int = 1250,
     val isNightGlowMode: Boolean = false,
     val hapticMappings: Map<String, String> = mapOf(
-        "Navigation Alert" to "Short Pulse",
-        "Hazard Detected" to "Double Pulse",
-        "Battery Low" to "Continuous"
+        "HELMET" to "2 Strong Pulses",
+        "SPEED" to "Continuous Buzz",
+        "SOS" to "Rapid SOS Pattern",
+        "NAV" to "1 Sharp Tap"
     )
-)
+) {
+    val speedKmH: Float get() = if (activeTripSpeedKmH > 0f) activeTripSpeedKmH else hubGpsSpeedKmH
+}
 
 class MainViewModel(
     private val wifiHubRepository: Esp32HubRepository = Esp32HubRepository(),
@@ -202,9 +205,22 @@ class MainViewModel(
             val result = activeHubRepository.pingHardware()
             if (result.isSuccess) {
                 onResult(true, result.getOrDefault("Hardware Online & Verified!"))
-            } else {
-                onResult(false, result.exceptionOrNull()?.message ?: "Connection Timed Out")
+                return@launch
             }
+
+            // Seamless Fallback: If Wi-Fi fails (e.g. phone is on internet Wi-Fi), try Bluetooth SPP!
+            if (_uiState.value.hardwareTransport == HardwareTransport.WIFI) {
+                val btRes = bluetoothHubRepository.connectToDevice(null)
+                if (btRes.isSuccess) {
+                    _uiState.update { it.copy(hardwareTransport = HardwareTransport.BLUETOOTH) }
+                    activeHubRepository = bluetoothHubRepository
+                    bindHubListeners(bluetoothHubRepository)
+                    onResult(true, "Auto-switched to Bluetooth SPP! (Connected to Hub while phone uses Wi-Fi for Internet)")
+                    return@launch
+                }
+            }
+
+            onResult(false, result.exceptionOrNull()?.message ?: "Connection Timed Out. If phone is on home Wi-Fi, pair and select Bluetooth SPP.")
         }
     }
 
@@ -272,15 +288,63 @@ class MainViewModel(
             )
         }
         viewModelScope.launch {
-            val modeStr = if (_uiState.value.vehicleType == VehicleType.TWO_WHEELER) "BIKE" else "CAR"
-            activeHubRepository.updateOledDisplay(
-                text = "TRIP ACTIVE",
-                mode = "Navigation",
-                speed = 0,
-                score = _uiState.value.summary.score,
-                glyph = "NAV",
-                vehicleMode = modeStr
-            )
+            val vehicleStr = if (_uiState.value.vehicleType == VehicleType.TWO_WHEELER) "BIKE" else "CAR"
+            launch {
+                try {
+                    wifiHubRepository.updateOledDisplay("TRIP ACTIVE", "Aero Cockpit", 0, _uiState.value.summary.score, _uiState.value.idleGlyph, vehicleStr, screen = 0)
+                } catch (_: Exception) {}
+            }
+            launch {
+                try {
+                    bluetoothHubRepository.updateOledDisplay("TRIP ACTIVE", "Aero Cockpit", 0, _uiState.value.summary.score, _uiState.value.idleGlyph, vehicleStr, screen = 0)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun endNavigation() {
+        viewModelScope.launch {
+            launch {
+                try {
+                    wifiHubRepository.endNavigation()
+                } catch (_: Exception) {}
+            }
+            launch {
+                try {
+                    bluetoothHubRepository.endNavigation()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun updateNavigation(maneuver: String, distance: String, eta: String, street: String) {
+        if (!_uiState.value.isTripActive) {
+            _uiState.update { it.copy(isTripActive = true) }
+        }
+        viewModelScope.launch {
+            // Concurrently broadcast to Wi-Fi and Bluetooth Hub channels
+            launch {
+                try {
+                    wifiHubRepository.updateNavigation(
+                        maneuver = maneuver,
+                        distance = distance,
+                        eta = eta,
+                        street = street,
+                        isNavActive = true
+                    )
+                } catch (_: Exception) {}
+            }
+            launch {
+                try {
+                    bluetoothHubRepository.updateNavigation(
+                        maneuver = maneuver,
+                        distance = distance,
+                        eta = eta,
+                        street = street,
+                        isNavActive = true
+                    )
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -320,13 +384,15 @@ class MainViewModel(
 
         viewModelScope.launch {
             val modeStr = if (_uiState.value.vehicleType == VehicleType.TWO_WHEELER) "BIKE" else "CAR"
-            hubRepository.updateOledDisplay(
+            activeHubRepository.endNavigation()
+            activeHubRepository.updateOledDisplay(
                 text = "TRIP COMPLETED",
                 mode = "Score: $finalScore",
                 speed = 0,
                 score = finalScore,
                 glyph = _uiState.value.idleGlyph,
-                vehicleMode = modeStr
+                vehicleMode = modeStr,
+                screen = 0
             )
         }
 
@@ -377,7 +443,7 @@ class MainViewModel(
         _uiState.update { it.copy(idleGlyph = glyph) }
         viewModelScope.launch {
             val vehicleStr = if (_uiState.value.vehicleType == VehicleType.TWO_WHEELER) "BIKE" else "CAR"
-            activeHubRepository.updateOledDisplay("GLYPH UPDATED", glyph, 0, _uiState.value.summary.score, glyph, vehicleStr)
+            activeHubRepository.updateOledDisplay("GLYPH ACTIVATED", glyph, 0, _uiState.value.summary.score, glyph, vehicleStr, screen = 4)
         }
     }
     
@@ -420,5 +486,9 @@ class MainViewModel(
             val vehicleStr = if (_uiState.value.vehicleType == VehicleType.TWO_WHEELER) "BIKE" else "CAR"
             activeHubRepository.updateOledDisplay("SAFE RIDE", "All Clear", 20, _uiState.value.summary.score, "SAFE", vehicleStr)
         }
+    }
+
+    fun toggleHubStatus() {
+        pingEsp32Hardware { _, _ -> }
     }
 }

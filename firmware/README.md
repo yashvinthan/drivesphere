@@ -125,3 +125,19 @@ The ESP32 Guardian Hub concurrently supports **both Wi-Fi and Bluetooth SPP**, a
   - Broadcasts SOS over both Wi-Fi HTTP polling and Bluetooth Serial socket.
   - The DriveSphere mobile app instantly triggers the 10-second countdown SOS screen with emergency SMS GPS dispatch.
 
+---
+
+## 7. MPU-6050 Crash & Fall Detection Calibration
+
+To prevent false alarms caused by potholes, engine vibration, or normal motorcycle cornering, the MPU-6050 uses the following calibrated parameters:
+
+| Parameter | Configuration / Value | Purpose & Rationale |
+| :--- | :--- | :--- |
+| **Full-Scale Range (AFS_SEL)** | **`±8g`** (`0x10` at Reg `0x1C`, `4096 LSB/g`) | Prevents sensor clipping/saturation on harsh bumps while capturing crash shock waves. |
+| **DLPF (Low-Pass Filter)** | **`44 Hz`** (`0x03` at Reg `0x1A`) | Attenuates high-frequency engine rumble, chassis rattle, and acoustic noise spikes. |
+| **Crash Impact Threshold** | **`> 5.2 G`** | Distinguishes actual vehicular collisions from road potholes/speed bumps (peak 2.5–3.8G). |
+| **Crash Multi-Sample Debounce**| **2 consecutive samples (100ms window)** | Rejects single-sample electrical impulse spikes or dropped breadboard jolts. |
+| **Motorcycle Fall Angle** | **`> 65°`** lean angle | Standard street riding leans up to 45°–50°; 65°+ indicates the bike is down. |
+| **Fall Sustained Duration** | **2.0 seconds (`2000 ms`) continuous** | Rejects momentary deep cornering, swerving, or transient bumps; triggers only if bike stays down. |
+| **Lean Angle Smoothing** | **EMA Filter (`α = 0.20`)** | Smooths out high-frequency road ripple from raw `atan2(ay, az)` computations. |
+

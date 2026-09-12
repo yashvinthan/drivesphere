@@ -4,10 +4,12 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -466,12 +468,19 @@ fun GuardianHubScreen(
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
                             onClick = {
+                                isPinging = true
                                 wifiHelper.connectToHubWifi(
                                     onConnected = {
                                         onUpdateIp("192.168.4.1")
-                                        onPingHardware { success, msg -> pingMessage = Pair(success, msg) }
+                                        onPingHardware { success, msg ->
+                                            isPinging = false
+                                            pingMessage = Pair(success, msg)
+                                        }
                                     },
-                                    onError = { err -> pingMessage = Pair(false, err) }
+                                    onError = { err ->
+                                        isPinging = false
+                                        pingMessage = Pair(false, err)
+                                    }
                                 )
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = Color.White),
@@ -480,7 +489,7 @@ fun GuardianHubScreen(
                         ) {
                             Icon(Icons.Default.Wifi, contentDescription = null, tint = Color.Black, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("CONNECT IN-APP", color = Color.Black, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                            Text(if (isPinging) "LINKING..." else "CONNECT IN-APP", color = Color.Black, style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
                         }
 
                         OutlinedButton(
@@ -490,6 +499,50 @@ fun GuardianHubScreen(
                             modifier = Modifier.weight(1f).height(44.dp)
                         ) {
                             Text("WI-FI PANEL", color = Color.White, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+
+                    // Live Wi-Fi Link State Card
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF161616)),
+                        border = BorderStroke(1.dp, Color(0xFF2A2A2A)),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(
+                                        if (state.isEsp32Connected) Color(0xFF00E676) else Color(0xFFFFB300),
+                                        CircleShape
+                                    )
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Wi-Fi: $wifiStatus",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.LightGray
+                            )
+                        }
+                    }
+
+                    // Hardware Wi-Fi Checklist
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF141414)),
+                        border = BorderStroke(1.dp, Color(0xFF282828)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Text("ESP32 WI-FI QUICK CONNECT:", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold), color = Color(0xFF00E676))
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("1. SoftAP SSID: 'DriveSphere-Hub' | Pass: 'drivesphere123'", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                            Text("2. Mobile data stays active for phone internet & navigation maps.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                            Text("3. Tap 'CONNECT IN-APP' above, or link via 'WI-FI PANEL' then tap 'PING'.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                         }
                     }
 

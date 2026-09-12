@@ -62,6 +62,12 @@ class DatabaseRepository(private val dao: DriveSphereDao) {
         dao.markVoucherRedeemed(voucherId)
     }
 
+    suspend fun saveOfficialChallans(challans: List<ChallanEntity>) {
+        if (challans.isNotEmpty()) {
+            dao.insertChallans(challans)
+        }
+    }
+
     suspend fun initializeDefaultDataIfNeeded() {
         // Initialize Default Past Trips if database is freshly installed
         if (dao.getPastTripsCount() == 0) {
@@ -72,43 +78,6 @@ class DatabaseRepository(private val dao: DriveSphereDao) {
                 PastTripEntity(date = "03 Mar 2026", distanceKm = 5.4, score = 100)
             )
             dao.insertPastTrips(defaultTrips)
-        }
-
-        // Initialize Official e-Challans if empty
-        if (dao.getChallansCount() == 0) {
-            val defaultChallans = listOf(
-                ChallanEntity(
-                    challanNumber = "DL-2026-CH-9812",
-                    vehicleNumber = "DL-01-AB-1234",
-                    violationType = "Overspeeding (> 60 km/h in 40 km/h zone)",
-                    location = "Outer Ring Road Sector 4 Junction",
-                    amount = 1000,
-                    date = "05 Mar 2026",
-                    status = "PENDING",
-                    scoreDeduction = 8
-                ),
-                ChallanEntity(
-                    challanNumber = "DL-2026-CH-7401",
-                    vehicleNumber = "DL-01-AB-1234",
-                    violationType = "Without Standard Helmet / Strap Unfastened",
-                    location = "University North Gate Checkpoint",
-                    amount = 500,
-                    date = "28 Feb 2026",
-                    status = "PAID",
-                    scoreDeduction = 5
-                ),
-                ChallanEntity(
-                    challanNumber = "DL-2026-CH-4190",
-                    vehicleNumber = "DL-01-AB-1234",
-                    violationType = "Mobile Device Usage While In Motion",
-                    location = "City Center Boulevard",
-                    amount = 1000,
-                    date = "14 Feb 2026",
-                    status = "PAID",
-                    scoreDeduction = 10
-                )
-            )
-            dao.insertChallans(defaultChallans)
         }
 
         // Initialize Partner Reward Vouchers if empty

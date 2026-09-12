@@ -4,11 +4,16 @@ import android.graphics.Bitmap
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import kotlin.math.min
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
@@ -17,12 +22,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.ai.AiSafetyVisionEngine
+import com.example.ai.AiVisionState
 import com.example.data.Esp32CamRepository
 import com.example.viewmodel.AppState
 import com.example.viewmodel.VehicleType
@@ -40,27 +50,38 @@ fun AiDashcamScreen(
     val coroutineScope = rememberCoroutineScope()
     var currentFrame by remember { mutableStateOf<Bitmap?>(null) }
     var isStreaming by remember { mutableStateOf(true) }
-    var isConnected by remember { mutableStateOf(false) }
     var isFlashOn by remember { mutableStateOf(false) }
-    var pingStatus by remember { mutableStateOf("Testing connection...") }
     var showIpDialog by remember { mutableStateOf(false) }
     var targetIpInput by remember { mutableStateOf(camRepo.getCameraIp()) }
+    var isScanning by remember { mutableStateOf(false) }
 
-    // Live frame polling loop
-    LaunchedEffect(isStreaming, camRepo.getCameraIp()) {
+    val isCamConnected by camRepo.isCamConnected.collectAsState(initial = false)
+    val isHubConnected by camRepo.isHubConnected.collectAsState(initial = false)
+    val camStatusText by camRepo.cameraStatusText.collectAsState(initial = "Searching for AI Camera...")
+
+    val visionEngine = remember { AiSafetyVisionEngine() }
+    val visionState by visionEngine.visionState.collectAsState()
+
+    // Live frame polling loop - Real hardware frames only
+    LaunchedEffect(isStreaming, camRepo.getCameraIp(), state.speedKmH, state.vehicleType) {
+        var tick = 0L
         while (isActive && isStreaming) {
             val result = camRepo.fetchSnapshot()
-            if (result.isSuccess) {
-                currentFrame = result.getOrNull()
-                isConnected = true
+            if (result.isSuccess && result.getOrNull() != null) {
+                val frame = result.getOrNull()
+                currentFrame = frame
+                frame?.let {
+                    visionEngine.analyzeFrame(it, state.speedKmH, state.vehicleType)
+                }
             } else {
-                // If failed, delay slightly before retry
-                delay(800)
-                val ping = camRepo.pingCamera()
-                isConnected = ping.isSuccess
-                pingStatus = ping.getOrDefault("Offline")
+                currentFrame = null
+                // Background ping to maintain connection status
+                if (tick % 10 == 0L) {
+                    camRepo.pingCamera()
+                }
             }
-            delay(70) // ~14 FPS snapshot stream
+            tick++
+            delay(70) // Real hardware snapshot polling interval (~14 FPS)
         }
     }
 
@@ -70,23 +91,34 @@ fun AiDashcamScreen(
                 title = {
                     Column {
                         Text(
-                            text = "AI SAFETY DASHCAM",
+                            text = if (state.vehicleType == VehicleType.TWO_WHEELER) "AI RIDER MONITOR (DMS)" else "AI DRIVER MONITOR (DMS)",
                             style = MaterialTheme.typography.titleMedium.copy(
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace,
                                 letterSpacing = 2.sp
                             )
                         )
+                        val (subtitleText, subtitleColor) = when {
+                            currentFrame != null ->
+                                Pair("LIVE DMS FEED ACTIVE • IP: ${camRepo.getCameraIp()}", Color(0xFF4CAF50))
+                            isCamConnected ->
+                                Pair("ALL-IN-ONE LINKED • FETCHING FRAMES...", Color(0xFFFFA000))
+                            isHubConnected ->
+                                Pair("HUB CONNECTED (192.168.4.1) • PROBING CAMERA...", Color(0xFFFFA000))
+                            else ->
+                                Pair("CAMERA OFFLINE • CONNECT TO 'DriveSphere-Hub'", Color.Gray)
+                        }
+
                         Text(
-                            text = if (isConnected) "LIVE FEED ACTIVE • IP: ${camRepo.getCameraIp()}" else "OFFLINE • STANDALONE AP: 192.168.4.1",
+                            text = subtitleText,
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (isConnected) Color(0xFF4CAF50) else Color.Gray
+                            color = subtitleColor
                         )
                     }
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
                     }
                 },
                 actions = {
@@ -117,6 +149,7 @@ fun AiDashcamScreen(
                 .fillMaxSize()
                 .padding(padding)
                 .padding(horizontal = 16.dp, vertical = 8.dp)
+                .verticalScroll(rememberScrollState())
         ) {
             // Main Video Viewport (16:9 Aspect Ratio)
             Box(
@@ -124,69 +157,287 @@ fun AiDashcamScreen(
                     .fillMaxWidth()
                     .height(260.dp)
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF111111))
-                    .then(
-                        if (isConnected) Modifier
-                        else Modifier
-                    ),
+                    .background(Color(0xFF111111)),
                 contentAlignment = Alignment.Center
             ) {
-                if (currentFrame != null && isConnected) {
+                if (currentFrame != null) {
                     Image(
                         bitmap = currentFrame!!.asImageBitmap(),
-                        contentDescription = "Live Camera Feed",
+                        contentDescription = "Live Hardware Camera Feed",
                         modifier = Modifier.fillMaxSize()
                     )
 
-                    // Bounding Box Simulation HUD Overlay
+                    // Tactical HUD Canvas Overlay for On-Device Driver Monitoring (DMS)
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        // 1. Red Alert Perimeter if Driver is Distracted or Drowsy
+                        if (visionState.distraction.isLookingDownAtPhone || visionState.distraction.isDrowsy) {
+                            drawRect(
+                                color = Color(0x33FF1744),
+                                size = size
+                            )
+                            drawRect(
+                                color = Color(0xFFFF1744),
+                                size = size,
+                                style = Stroke(width = 3.dp.toPx())
+                            )
+                        }
+
+                        // 2. Driver Face Tracking Tactical Reticle
+                        val normFace = visionState.distraction.normalizedFaceBox
+                        if (normFace != null) {
+                            val fLeft = normFace.left * size.width
+                            val fTop = normFace.top * size.height
+                            val fRight = normFace.right * size.width
+                            val fBottom = normFace.bottom * size.height
+                            val fWidth = fRight - fLeft
+                            val fHeight = fBottom - fTop
+
+                            val faceColor = when {
+                                visionState.distraction.isLookingDownAtPhone || visionState.distraction.isDrowsy -> Color(0xFFFF1744)
+                                visionState.distraction.isLookingAwayFromRoad -> Color(0xFFFF9100)
+                                else -> Color(0xFF00E5FF)
+                            }
+
+                            // Translucent face tint
+                            drawRect(
+                                color = faceColor.copy(alpha = 0.08f),
+                                topLeft = Offset(fLeft, fTop),
+                                size = Size(fWidth, fHeight)
+                            )
+
+                            // Tactical 4-Corner Reticle Brackets
+                            val cLen = min(24f, min(fWidth, fHeight) * 0.25f)
+                            val strokeW = 3.5f
+
+                            // Top-Left
+                            drawLine(faceColor, Offset(fLeft, fTop), Offset(fLeft + cLen, fTop), strokeWidth = strokeW)
+                            drawLine(faceColor, Offset(fLeft, fTop), Offset(fLeft, fTop + cLen), strokeWidth = strokeW)
+
+                            // Top-Right
+                            drawLine(faceColor, Offset(fRight, fTop), Offset(fRight - cLen, fTop), strokeWidth = strokeW)
+                            drawLine(faceColor, Offset(fRight, fTop), Offset(fRight, fTop + cLen), strokeWidth = strokeW)
+
+                            // Bottom-Left
+                            drawLine(faceColor, Offset(fLeft, fBottom), Offset(fLeft + cLen, fBottom), strokeWidth = strokeW)
+                            drawLine(faceColor, Offset(fLeft, fBottom), Offset(fLeft, fBottom - cLen), strokeWidth = strokeW)
+
+                            // Bottom-Right
+                            drawLine(faceColor, Offset(fRight, fBottom), Offset(fRight - cLen, fBottom), strokeWidth = strokeW)
+                            drawLine(faceColor, Offset(fRight, fBottom), Offset(fRight, fBottom - cLen), strokeWidth = strokeW)
+
+                            // Center eye-level gaze tracking pip
+                            val gazeCenter = Offset(fLeft + fWidth / 2f, fTop + fHeight * 0.40f)
+                            drawCircle(color = faceColor, radius = 3.5f, center = gazeCenter)
+                        }
+
+                        // 3. Rider Helmet Dome Reticle (Two-Wheeler Mode)
+                        val normHelmet = visionState.helmet.normalizedHelmetBox
+                        if (state.vehicleType == VehicleType.TWO_WHEELER && normHelmet != null) {
+                            val hLeft = normHelmet.left * size.width
+                            val hTop = normHelmet.top * size.height
+                            val hRight = normHelmet.right * size.width
+                            val hBottom = normHelmet.bottom * size.height
+                            val hWidth = hRight - hLeft
+
+                            val helmetColor = if (visionState.helmet.isHelmetWorn) Color(0xFF00E676) else Color(0xFFFF5722)
+                            val cLen = min(20f, hWidth * 0.25f)
+                            val strokeW = 3f
+
+                            // Top-Left dome bracket
+                            drawLine(helmetColor, Offset(hLeft, hTop), Offset(hLeft + cLen, hTop), strokeWidth = strokeW)
+                            drawLine(helmetColor, Offset(hLeft, hTop), Offset(hLeft, hTop + cLen), strokeWidth = strokeW)
+
+                            // Top-Right dome bracket
+                            drawLine(helmetColor, Offset(hRight, hTop), Offset(hRight - cLen, hTop), strokeWidth = strokeW)
+                            drawLine(helmetColor, Offset(hRight, hTop), Offset(hRight, hTop + cLen), strokeWidth = strokeW)
+                        }
+
+                        // 4. Secondary Objects Reticles (e.g. Phone or Handheld electronics)
+                        visionState.trackedObstacles.forEach { obs ->
+                            val left = obs.normalizedBox.left * size.width
+                            val top = obs.normalizedBox.top * size.height
+                            val right = obs.normalizedBox.right * size.width
+                            val bottom = obs.normalizedBox.bottom * size.height
+                            val boxWidth = right - left
+                            val boxHeight = bottom - top
+
+                            val color = if (obs.label.contains("PHONE") || visionState.distraction.isPhoneObjectDetected) Color(0xFFFF1744) else Color(0xFFFFA000)
+                            val cLen = min(16f, min(boxWidth, boxHeight) * 0.25f)
+                            val strokeW = 2.5f
+
+                            drawLine(color, Offset(left, top), Offset(left + cLen, top), strokeWidth = strokeW)
+                            drawLine(color, Offset(left, top), Offset(left, top + cLen), strokeWidth = strokeW)
+                            drawLine(color, Offset(right, top), Offset(right - cLen, top), strokeWidth = strokeW)
+                            drawLine(color, Offset(right, top), Offset(right, top + cLen), strokeWidth = strokeW)
+                            drawLine(color, Offset(left, bottom), Offset(left + cLen, bottom), strokeWidth = strokeW)
+                            drawLine(color, Offset(left, bottom), Offset(left, bottom - cLen), strokeWidth = strokeW)
+                            drawLine(color, Offset(right, bottom), Offset(right - cLen, bottom), strokeWidth = strokeW)
+                            drawLine(color, Offset(right, bottom), Offset(right, bottom - cLen), strokeWidth = strokeW)
+                        }
+                    }
+
+                    // Live Hardware Camera HUD Overlay
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(12.dp)
+                            .padding(10.dp)
                     ) {
-                        // Top Left: Recording Status
+                        // Top HUD Bar: Recording Status, ML Inference Latency & Attention
                         Row(
-                            verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
-                                .align(Alignment.TopStart)
-                                .background(Color(0xAA000000), RoundedCornerShape(6.dp))
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .fillMaxWidth()
+                                .align(Alignment.TopCenter),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
+                            // Left: Recording & ML Frame Latency
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
-                                    .size(8.dp)
-                                    .background(Color.Red, CircleShape)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("LIVE REC", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold), color = Color.White)
+                                    .background(Color(0xCC000000), RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .background(Color.Red, CircleShape)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "LIVE DMS",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = Color.White
+                                )
+                                if (visionState.inferenceTimeMs > 0) {
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "• ${visionState.inferenceTimeMs}ms",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = Color(0xFF00E676)
+                                    )
+                                }
+                            }
+
+                            // Right: Vehicle Mode & Attention Score
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .background(Color(0xCC000000), RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = if (visionState.distraction.isDriverFaceVisible)
+                                        "ATTN: ${visionState.distraction.attentionScore}%"
+                                    else
+                                        if (state.vehicleType == VehicleType.TWO_WHEELER) "RIDER DMS" else "CABIN DMS",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        fontFamily = FontFamily.Monospace
+                                    ),
+                                    color = if (visionState.distraction.attentionScore >= 70) Color.Cyan else Color(0xFFFF9100)
+                                )
+                            }
                         }
 
-                        // Top Right: Vehicle Mode
-                        Text(
-                            text = if (state.vehicleType == VehicleType.TWO_WHEELER) "BIKE MONITOR" else "CAR MONITOR",
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace),
-                            color = Color.Cyan,
+                        // Center: High-Priority Emergency Alert Banners
+                        val activeAlert: Pair<String, Color>? = when {
+                            visionState.distraction.isLookingDownAtPhone ->
+                                Pair("⚠️ PHONE DISTRACTION DETECTED • EYES ON ROAD", Color(0xFFFF1744))
+                            visionState.distraction.isLookingAwayFromRoad ->
+                                Pair("⚠️ ATTENTION: LOOK AT ROAD • GAZE DEFLECTED", Color(0xFFFF9100))
+                            visionState.distraction.isDrowsy ->
+                                Pair("⚠️ DROWSINESS DETECTED • REST RECOMMENDED", Color(0xFFFF1744))
+                            state.vehicleType == VehicleType.TWO_WHEELER && visionState.helmet.isChecked && !visionState.helmet.isHelmetWorn ->
+                                Pair("⚠️ HELMET REQUIRED • NO HELMET DETECTED", Color(0xFFFF5722))
+                            else -> null
+                        }
+
+                        if (activeAlert != null) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .background(Color(0xEE000000), RoundedCornerShape(8.dp))
+                                    .border(1.5.dp, activeAlert.second, RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                Text(
+                                    text = activeAlert.first,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        fontFamily = FontFamily.Monospace,
+                                        letterSpacing = 0.8.sp
+                                    ),
+                                    color = activeAlert.second
+                                )
+                            }
+                        }
+
+                        // Bottom Row: Gaze Telemetry & Target IP
+                        Row(
                             modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .background(Color(0xAA000000), RoundedCornerShape(6.dp))
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
+                                .fillMaxWidth()
+                                .align(Alignment.BottomCenter),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (visionState.distraction.isDriverFaceVisible) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
+                                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .background(
+                                                if (visionState.distraction.isLookingDownAtPhone) Color.Red else Color.Cyan,
+                                                CircleShape
+                                            )
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "PITCH: ${"%.0f".format(visionState.distraction.headPitchDeg)}° | YAW: ${"%.0f".format(visionState.distraction.headYawDeg)}°",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 10.sp
+                                        ),
+                                        color = Color.White
+                                    )
+                                }
+                            } else {
+                                Spacer(modifier = Modifier.width(1.dp))
+                            }
+
+                            Text(
+                                text = "ESP32-CAM: ${camRepo.getCameraIp()}",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 10.sp
+                                ),
+                                color = Color(0xBBFFFFFF),
+                                modifier = Modifier
+                                    .background(Color(0xCC000000), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 3.dp)
+                            )
+                        }
                     }
                 } else {
-                    // Offline Fallback Card
+                    // Offline / Awaiting Hardware Fallback Card
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.padding(24.dp)
+                        modifier = Modifier.padding(20.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.VideocamOff,
+                            imageVector = if (isHubConnected) Icons.Default.Videocam else Icons.Default.VideocamOff,
                             contentDescription = null,
-                            tint = Color.Gray,
-                            modifier = Modifier.size(48.dp)
+                            tint = if (isHubConnected) Color(0xFFFFA000) else Color.Gray,
+                            modifier = Modifier.size(44.dp)
                         )
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "CAMERA FEED OFFLINE",
+                            text = if (isHubConnected) "AWAITING ESP32-CAM FEED" else "CAMERA FEED OFFLINE",
                             style = MaterialTheme.typography.titleSmall.copy(
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace,
@@ -196,79 +447,134 @@ fun AiDashcamScreen(
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "Connect phone to Wi-Fi 'DriveSphere-Cam' or Guardian Hub",
+                            text = if (isHubConnected)
+                                "Guardian Hub is online (192.168.4.1).\nSearching for ESP32-CAM on 192.168.4.2 or standalone AP 192.168.5.1..."
+                            else
+                                "Connect phone to Wi-Fi 'DriveSphere-Cam' or Guardian Hub",
                             style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray
+                            color = Color.Gray,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
                         )
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
                         Button(
                             onClick = {
                                 coroutineScope.launch {
-                                    val res = camRepo.pingCamera()
-                                    isConnected = res.isSuccess
-                                    pingStatus = res.getOrDefault("Unreachable")
+                                    isScanning = true
+                                    val res = camRepo.scanAndDiscoverCamera()
+                                    if (res.isSuccess) {
+                                        camRepo.fetchSnapshot()
+                                    }
+                                    isScanning = false
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF222222)),
                             shape = RoundedCornerShape(8.dp)
                         ) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            if (isScanning) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), color = Color.White, strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                            }
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("RETRY CONNECTION", style = MaterialTheme.typography.labelSmall)
+                            Text(if (isScanning) "SCANNING SUBNETS..." else "AUTO-DISCOVER CAMERA", style = MaterialTheme.typography.labelSmall)
                         }
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
-            // Real-Time AI Safety Diagnostics Cards
-            Text(
-                text = "REAL-TIME SAFETY COMPLIANCE",
-                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp),
-                color = Color.Gray
-            )
+            // Real-Time AI Safety Diagnostics Cards (Bound to live sensors and ML inference)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "DRIVER MONITORING COMPLIANCE",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp),
+                    color = Color.Gray
+                )
+                Text(
+                    text = if (currentFrame != null) "ON-DEVICE DMS ACTIVE" else "AWAITING FEED",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    ),
+                    color = if (currentFrame != null) Color(0xFF00E676) else Color.Gray
+                )
+            }
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Primary Safety Badge (Helmet in Bike Mode / Seatbelt in Car Mode)
+            // 1. Rider Helmet Wear / Driver Seatbelt
             if (state.vehicleType == VehicleType.TWO_WHEELER) {
                 SafetyMetricRow(
-                    title = "Rider Helmet Wear",
-                    status = "COMPLIANT (99% CONFIDENCE)",
+                    title = "Rider Helmet Compliance (AI Vision)",
+                    status = if (currentFrame != null) visionState.helmet.statusText else "CAMERA FEED REQUIRED",
                     icon = Icons.Default.SportsMotorsports,
-                    isSafe = true
+                    isSafe = if (currentFrame != null) visionState.helmet.isHelmetWorn else false
                 )
             } else {
                 SafetyMetricRow(
-                    title = "Driver Seatbelt",
-                    status = "BUCKLED (98% CONFIDENCE)",
+                    title = "Driver Seatbelt Compliance",
+                    status = if (currentFrame != null) visionState.helmet.statusText else "CAMERA FEED REQUIRED",
                     icon = Icons.Default.AirlineSeatReclineNormal,
-                    isSafe = true
+                    isSafe = if (currentFrame != null) visionState.helmet.isHelmetWorn else false
                 )
             }
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Secondary Safety Badge: Distraction / Eyes on Road
+            // 2. Mobile Phone Distraction (AI Pose & Handheld Object Detection)
+            val phoneDistractionStatus = if (currentFrame != null) {
+                when {
+                    visionState.distraction.isLookingDownAtPhone -> "PHONE DISTRACTION ACTIVE"
+                    visionState.distraction.isPhoneObjectDetected -> "PHONE IN HAND DETECTED"
+                    else -> "HANDS CLEAR • ATTENTIVE"
+                }
+            } else {
+                "CAMERA FEED REQUIRED"
+            }
+
             SafetyMetricRow(
-                title = "Mobile Phone Distraction",
-                status = "NO DEVICE DETECTED • EYES ON ROAD",
+                title = "Mobile Phone Distraction (AI Pose)",
+                status = phoneDistractionStatus,
                 icon = Icons.Default.PhoneAndroid,
-                isSafe = true
+                isSafe = if (currentFrame != null) !visionState.distraction.isLookingDownAtPhone && !visionState.distraction.isPhoneObjectDetected else false
             )
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Third Safety Badge: Optical Flow & Speed
+            // 3. Driver Gaze & Drowsiness (Eye-Blink Tracker)
+            val gazeStatusText = if (currentFrame != null) {
+                when {
+                    visionState.distraction.isDrowsy -> "DROWSY • LOW BLINK FREQUENCY"
+                    visionState.distraction.isLookingAwayFromRoad -> "LOOKING AWAY • DEFLECTED GAZE"
+                    else -> "FORWARD GAZE • NOMINAL"
+                }
+            } else {
+                "CAMERA FEED REQUIRED"
+            }
+
             SafetyMetricRow(
-                title = "Road Vision Speedometer",
-                status = "${state.speedKmH.toInt()} KM/H • CLEAR FORWARD VISIBILITY",
-                icon = Icons.Default.Speed,
-                isSafe = state.speedKmH <= 65f
+                title = "Driver Gaze & Drowsiness (Eye Tracker)",
+                status = gazeStatusText,
+                icon = Icons.Default.Visibility,
+                isSafe = if (currentFrame != null) !visionState.distraction.isDrowsy && !visionState.distraction.isLookingAwayFromRoad else false
             )
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // 4. Attention Index & Speedometer
+            SafetyMetricRow(
+                title = "Driver Attention Index & Speed",
+                status = "${visionState.distraction.attentionScore}% ATTENTION • ${state.speedKmH.toInt()} KM/H",
+                icon = Icons.Default.Speed,
+                isSafe = visionState.distraction.attentionScore >= 70
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
 
             // Quick Camera Actions Bar
             Row(
@@ -313,6 +619,7 @@ fun AiDashcamScreen(
                     )
                 }
             }
+            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 
@@ -323,15 +630,47 @@ fun AiDashcamScreen(
             title = { Text("Camera IP Address", fontWeight = FontWeight.Bold) },
             text = {
                 Column {
-                    Text("Default when connected to Hub: 192.168.4.2\nDefault in Standalone AP mode: 192.168.4.1", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    Text(
+                        "Vehicle Hub Network: 192.168.4.2\nStandalone Camera AP: 192.168.5.1\nSSID: DriveSphere-Cam",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray
+                    )
                     Spacer(modifier = Modifier.height(12.dp))
                     OutlinedTextField(
                         value = targetIpInput,
                         onValueChange = { targetIpInput = it },
-                        label = { Text("ESP32-CAM IP") },
+                        label = { Text("ESP32-CAM Target IP") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("Quick Presets:", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(
+                            selected = targetIpInput == "192.168.4.2",
+                            onClick = { targetIpInput = "192.168.4.2" },
+                            label = { Text("192.168.4.2 (Hub)") }
+                        )
+                        FilterChip(
+                            selected = targetIpInput == "192.168.4.1",
+                            onClick = { targetIpInput = "192.168.4.1" },
+                            label = { Text("192.168.4.1 (AP)") }
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(
+                            selected = targetIpInput == "192.168.43.2",
+                            onClick = { targetIpInput = "192.168.43.2" },
+                            label = { Text("192.168.43.2 (Hotspot)") }
+                        )
+                        FilterChip(
+                            selected = targetIpInput == "192.168.43.3",
+                            onClick = { targetIpInput = "192.168.43.3" },
+                            label = { Text("192.168.43.3") }
+                        )
+                    }
                 }
             },
             confirmButton = {
@@ -339,8 +678,7 @@ fun AiDashcamScreen(
                     camRepo.setCameraIp(targetIpInput)
                     showIpDialog = false
                     coroutineScope.launch {
-                        val res = camRepo.pingCamera()
-                        isConnected = res.isSuccess
+                        camRepo.pingCamera()
                     }
                 }) {
                     Text("Save & Connect")
@@ -398,7 +736,7 @@ private fun SafetyMetricRow(
                 )
                 Text(
                     text = status,
-                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    style = MaterialTheme.typography.bodySmall,
                     color = if (isSafe) Color(0xFF4CAF50) else Color(0xFFF44336)
                 )
             }

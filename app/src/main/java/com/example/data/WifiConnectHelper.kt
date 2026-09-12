@@ -28,6 +28,18 @@ class WifiConnectHelper(private val context: Context) {
         onConnected: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {
+        // 1. Check if phone is already linked to DriveSphere-Hub AP
+        try {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+            val activeSsid = wifiManager?.connectionInfo?.ssid?.replace("\"", "") ?: ""
+            if (activeSsid.equals(ssid, ignoreCase = true)) {
+                NetworkBinder.bindToWifi()
+                _connectionStatus.value = "Connected to '$ssid'"
+                onConnected()
+                return
+            }
+        } catch (_: Exception) {}
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
                 // Cancel existing request if any
@@ -49,6 +61,7 @@ class WifiConnectHelper(private val context: Context) {
                 val callback = object : ConnectivityManager.NetworkCallback() {
                     override fun onAvailable(network: Network) {
                         super.onAvailable(network)
+                        NetworkBinder.setHubNetwork(network)
                         connectivityManager.bindProcessToNetwork(network)
                         _connectionStatus.value = "Connected to $ssid (In-App Linked)"
                         onConnected()
@@ -56,22 +69,25 @@ class WifiConnectHelper(private val context: Context) {
 
                     override fun onUnavailable() {
                         super.onUnavailable()
+                        NetworkBinder.setHubNetwork(null)
                         _connectionStatus.value = "Wi-Fi link declined or unavailable"
-                        onError("Wi-Fi network request unavailable")
+                        onError("Wi-Fi network request unavailable. Use Wi-Fi Panel to link.")
                     }
 
                     override fun onLost(network: Network) {
                         super.onLost(network)
+                        NetworkBinder.setHubNetwork(null)
                         _connectionStatus.value = "Wi-Fi link disconnected"
                     }
                 }
 
                 networkCallback = callback
                 connectivityManager.requestNetwork(request, callback)
+            } catch (e: SecurityException) {
+                _connectionStatus.value = "Using Wi-Fi Panel..."
+                launchWifiSettingsPanel()
             } catch (e: Exception) {
-                _connectionStatus.value = "Failed: ${e.localizedMessage}"
-                onError(e.localizedMessage ?: "Unknown error")
-                // Fallback to in-app settings panel
+                _connectionStatus.value = "Notice: ${e.localizedMessage}"
                 launchWifiSettingsPanel()
             }
         } else {
@@ -109,6 +125,7 @@ class WifiConnectHelper(private val context: Context) {
             } catch (_: Exception) {}
         }
         networkCallback = null
+        NetworkBinder.setHubNetwork(null)
         _connectionStatus.value = "Wi-Fi Disconnected"
     }
 }
